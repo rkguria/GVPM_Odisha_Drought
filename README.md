@@ -60,8 +60,6 @@ These datasets include:
 
 All scripts are written in **R** and organized to follow the methodological workflow of the manuscript.
 
-Directory:
-
 
 Directory:
 
