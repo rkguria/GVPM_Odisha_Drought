@@ -1,0 +1,100 @@
+# ----------------------------------------------------------
+# Script: 01_Bias_Correction_CMIP6.R
+# Purpose: Bias correction of CMIP6 monthly rainfall using
+#          quantile mapping against IMD observations
+# Input data:
+#   - Raw CMIP6 rainfall (historical & SSPs)
+#   - IMD gridded rainfall (0.25°)
+# Output:
+#   - processed_rainfall_data.xlsx
+#   - Bias-corrected CMIP6 rainfall (grid-wise)
+# Related manuscript section: 2.3
+# Author: Rajkumar Guria & Manoranjan Mishra
+# ----------------------------------------------------------
+
+
+#1. Setup: Required Packages
+
+# Install and load all necessary packages
+required <- c("tidyverse", "hydroGOF", "lubridate", "qmap")
+for (pkg in required) if (!requireNamespace(pkg, quietly=TRUE)) install.packages(pkg)
+library(tidyverse)
+library(hydroGOF)
+library(lubridate)
+library(qmap)
+
+
+#2. Data Import with File Paths
+data_dir <- "G:/Ph.D/Drought/CMIP6_work/Data/CMIP6_data"
+model_files <- list.files(
+  path = data_dir,
+  pattern = "^CMIP6_.*_1981_2014\\.csv$",
+  full.names = TRUE
+)
+
+# Combine all model histories into one dataframe
+all_data <- map_df(model_files, ~ read_csv(.x) %>%
+                     mutate(model = stringr::str_match(basename(.x), "^CMIP6_(.*)_1981_2014\\.csv$")[,2]))
+# Ensure types are correct
+all_data <- all_data %>%
+  mutate(
+    yearMonth = ym(yearMonth),
+    Grid_Number = as.character(Grid_Number),
+    sim_rainfall = as.numeric(sim_rainfall),
+    obs_rainfall = as.numeric(obs_rainfall)
+  )
+
+#3. Add Period Marker (for Future Projections)
+all_data <- all_data %>%
+  mutate(period = "hist") # Later add future scenario data with period="future"
+
+
+#4. Bias Correction by Grid and Model (Quantile Mapping)
+bias_correct <- function(df) {
+  obs_hist <- df$obs_rainfall[df$period == "hist"]
+  sim_hist <- df$sim_rainfall[df$period == "hist"]
+  # Only correct if enough data (e.g., >80% available)
+  if (length(obs_hist[!is.na(obs_hist)]) >= 350 & length(sim_hist[!is.na(sim_hist)]) >= 350) {
+    fit <- fitQmapQUANT(obs = obs_hist, mod = sim_hist, qstep = 0.01)
+    sim_bc <- doQmapQUANT(df$sim_rainfall, fit)
+    df$sim_rainfall_biascorrected <- sim_bc
+  } else {
+    df$sim_rainfall_biascorrected <- NA
+  }
+  return(df)
+}
+
+corrected_data <- all_data %>%
+  group_by(model, Grid_Number) %>%
+  group_modify(~ bias_correct(.x)) %>%
+  ungroup()
+
+#5. Export Bias-Corrected Data
+write_csv(corrected_data, file.path(data_dir, "CMIP6_biascorrected_1981_2014.csv"))
+
+
+library(ggplot2)
+cdf_check <- corrected_data %>%
+  filter(model == "ACCESS-CM2", Grid_Number == "Grid_1", !is.na(sim_rainfall_biascorrected)) %>%
+  dplyr::select(yearMonth, obs_rainfall, sim_rainfall, sim_rainfall_biascorrected) %>%
+  pivot_longer(
+    cols = c(obs_rainfall, sim_rainfall, sim_rainfall_biascorrected),
+    names_to = "series", values_to = "rainmm"
+  )
+
+ggplot(cdf_check, aes(rainmm, color = series)) +
+  stat_ecdf(size = 1) +
+  labs(title = "Empirical CDF: Observed vs. Raw & Bias-Corrected Model (Grid 1)",
+       x = "Monthly Rainfall (mm)", y = "ECDF", color = "Series")
+
+
+print(head(cdf_check))
+summary(cdf_check)
+
+ggplot(cdf_check, aes(rainmm, color = series)) +
+  stat_ecdf(size = 1) +
+  labs(
+    title = "Empirical CDF: Observed vs. Raw & Bias-Corrected Model (Grid 1)",
+    x = "Monthly Rainfall (mm)", y = "ECDF", color = "Series"
+  )
+

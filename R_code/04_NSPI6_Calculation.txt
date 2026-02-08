@@ -1,0 +1,120 @@
+# ----------------------------------------------------------
+# Script: 04_NSPI6_Calculation.R
+# Purpose: Compute historical NSPI-6 using kernel density
+#          estimation (KDE)
+# Input data:
+#   - CMIP6_MME_rainfall.xlsx (historical period)
+# Output:
+#   - NSPI-6 time series
+#   - Historical drought events
+# Related manuscript section: 2.5
+# Author: Rajkumar Guria & Manoranjan Mishra
+# ----------------------------------------------------------
+
+
+library(dplyr)
+library(readr)
+library(zoo)        # rollapply for rolling sums
+library(lubridate)   # date parsing
+library(purrr)       # reduce
+
+# Step 1: Read the data
+data_path <- "G:/Ph.D/Drought/CMIP6_work/Data/CMIP6_data/Future_Bias_Corrected/CMIP6_MME_rainfall.csv"
+df <- read_csv(data_path, show_col_types = FALSE)
+
+# Step 2: Convert Date column to Date format
+df <- df %>%
+  mutate(Date = as.Date(Date))  # or use lubridate::ymd(Date) if needed
+
+# Step 3: Filter dataset for ssp245 scenario only
+df_ssp245 <- df %>%
+  filter(scenario == "ssp245") %>%
+  # Step 3a: Remove records with missing or non-numeric precipitation
+  filter(!is.na(MME_rainfall)) %>%
+  mutate(MME_rainfall = as.numeric(MME_rainfall)) %>%
+  filter(!is.na(MME_rainfall)) %>%
+  arrange(Grid_Number, Date)
+
+# Step 4: Define the NSPI calculation function using Gaussian KDE
+calc_nspi <- function(x) {
+  x_clean <- na.omit(x)
+  if (length(unique(x_clean)) <= 1) {
+    return(rep(NA_real_, length(x)))
+  }
+  
+  kd <- density(
+    x_clean,
+    kernel = "gaussian",
+    bw = "nrd0",
+    from = min(x_clean),
+    to = max(x_clean),
+    n = 1024
+  )
+  
+  Fx <- sapply(x, function(v) {
+    if (is.na(v)) {
+      NA_real_
+    } else {
+      sum(kd$y[kd$x <= v]) / sum(kd$y)
+    }
+  })
+  
+  Fx[Fx < 1e-6] <- 1e-6
+  Fx[Fx > 1 - 1e-6] <- 1 - 1e-6
+  
+  stats::qnorm(Fx)
+}
+
+# Step 5: Define rolling window sizes (months)
+timescales <- c(1, 3, 6, 9, 12, 24, 36, 48)
+
+# Prepare a list to store results for each scale
+results_list <- list()
+
+# Step 6: Calculate rolling sums and NSPI for each time scale, grid-wise
+for (scale in timescales) {
+  message(paste("Calculating NSPI for scale:", scale, "months..."))
+  
+  # Calculate rolling sums with proper NA handling:
+  df_roll <- df_ssp245 %>%
+    group_by(Grid_Number) %>%
+    arrange(Date) %>%
+    mutate(
+      # Calculate count of non-NA values in the rolling window
+      valid_count = zoo::rollapply(!is.na(MME_rainfall), width = scale, FUN = sum, align = "right", fill = NA),
+      # Only compute rolling sum if all observations present in window
+      roll_precip = ifelse(valid_count == scale,
+                           zoo::rollapply(MME_rainfall, width = scale, FUN = sum, align = "right", fill = NA),
+                           NA_real_)
+    ) %>%
+    ungroup() %>%
+    select(-valid_count)
+  
+  # Compute NSPI on rolling sums, grid-wise
+  df_nspi <- df_roll %>%
+    group_by(Grid_Number) %>%
+    arrange(Date) %>%
+    mutate(!!paste0("NSPI_", scale) := calc_nspi(roll_precip)) %>%
+    ungroup()
+  
+  # Select only relevant columns for merging later
+  df_scale <- df_nspi %>%
+    select(scenario, Grid_Number, Date, !!paste0("NSPI_", scale))
+  
+  results_list[[paste0("NSPI_", scale)]] <- df_scale
+}
+
+# Step 7: Merge NSPI columns for all scales
+NSPI_multi_scale <- purrr::reduce(results_list, full_join, by = c("scenario", "Grid_Number", "Date"))
+
+# Step 8: Save NSPI data to CSV
+output_file <- "G:/Ph.D/Drought/CMIP6_work/Data/CMIP6_data/Future_Bias_Corrected/NSPI_ssp245_multi_scale_by_grid.csv"
+write.csv(NSPI_multi_scale, output_file, row.names = FALSE)
+
+# Step 9: Preview results
+head(NSPI_multi_scale)
+
+
+
+
+

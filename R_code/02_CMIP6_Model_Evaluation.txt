@@ -1,0 +1,235 @@
+# ----------------------------------------------------------
+# Script: 02_CMIP6_Model_Evaluation.R
+# Purpose: Evaluate CMIP6 rainfall performance against IMD
+#          observations before bias correction
+# Input data:
+#   - Raw CMIP6 rainfall (historical period)
+#   - IMD observed rainfall (0.25°)
+# Output:
+#   - Model performance metrics (RMSE, KGE, Bias, Correlation)
+#   - Tables and figures for model comparison
+# Related manuscript section: 3.1
+# Author: Rajkumar Guria & Manoranjan Mishra
+# ----------------------------------------------------------
+
+
+# Step 1: Install and load required packages
+if (!requireNamespace(c("tidyverse", "hydroGOF", "lubridate", "SPEI", "qmap", "openair", "RColorBrewer"), quietly = TRUE)) {
+  install.packages(c("tidyverse", "hydroGOF", "lubridate", "SPEI", "qmap", "openair", "RColorBrewer"))
+}
+library(tidyverse)
+library(hydroGOF)
+library(lubridate)
+library(SPEI)
+library(qmap)
+library(openair)
+library(RColorBrewer)
+
+# Step 2: Prepare Your Data
+model_files <- list.files(
+  path       = "G:/Ph.D/Drought/CMIP6_work/Data/CMIP6_data",
+  pattern    = "^CMIP6_.*_1981_2014\\.csv$",
+  full.names = TRUE
+)
+
+# Step 3: Read and combine all model data, extracting model names correctly
+all_data <- map_df(model_files, ~ read_csv(.x) %>%
+                     mutate(model = str_match(basename(.x), "^CMIP6_(.*)_1981_2014\\.csv$")[,2]))
+
+# Step 4: Ensure proper types
+all_data <- all_data %>%
+  mutate(
+    yearMonth    = ym(yearMonth),             # convert "YYYY-MM" to yearmon
+    Grid_Number  = as.character(Grid_Number),
+    sim_rainfall = as.numeric(sim_rainfall),
+    obs_rainfall = as.numeric(obs_rainfall)
+  )
+
+# Step 5: Define a function to compute metrics for one model & grid
+compute_metrics <- function(df) {
+  sim <- df$sim_rainfall; obs <- df$obs_rainfall
+  valid <- !is.na(sim) & !is.na(obs)
+  sim <- sim[valid]; obs <- obs[valid]
+  tibble(
+    r     = cor(sim, obs),
+    bias  = mean(sim - obs),
+    rmse  = rmse(obs, sim),    # from hydroGOF
+    mae   = mae(obs, sim),
+    nse   = NSE(sim, obs),
+    pbias = pbias(sim, obs),
+    kge   = KGE(obs, sim),
+    cvr   = sd(sim) / sd(obs)   # coefficient of variation ratio
+  )
+}
+
+# Step 6: Compute metrics for each model and grid
+metrics_table <- all_data %>%
+  group_by(model, Grid_Number) %>%
+  group_modify(~ compute_metrics(.x)) %>%
+  ungroup()
+
+# Step 7: Compute composite score and rank models
+weights <- c(r = 0.3, nse = 0.3, rmse = -0.2, bias = -0.1, kge = 0.2)
+metrics_table <- metrics_table %>%
+  mutate(
+    composite = r * weights["r"] +
+      nse * weights["nse"] +
+      (1 - rmse / max(rmse, na.rm = TRUE)) * weights["rmse"] +
+      (1 - abs(bias) / max(abs(bias), na.rm = TRUE)) * weights["bias"] +
+      kge * weights["kge"]
+  )
+
+model_ranking <- metrics_table %>%
+  group_by(model) %>%
+  summarize(mean_score = mean(composite, na.rm = TRUE)) %>%
+  arrange(desc(mean_score)) %>%
+  mutate(rank = row_number())
+
+# Step 8: Save results to CSV
+write_csv(metrics_table, "G:/Ph.D/Drought/CMIP6_work/Data/CMIP6_data/CMIP6_model_grid_metrics.csv")
+write_csv(model_ranking, "G:/Ph.D/Drought/CMIP6_work/Data/CMIP6_data/CMIP6_model_overall_ranking.csv")
+
+# Step 9: Visualization
+
+# 9a. Bar chart of composite scores (median ± IQR)
+library(ggplot2)
+summary_tbl <- metrics_table %>%
+  group_by(model) %>%
+  summarize(
+    median = median(composite, na.rm = TRUE),
+    q1     = quantile(composite, .25, na.rm = TRUE),
+    q3     = quantile(composite, .75, na.rm = TRUE)
+  )
+ggplot(summary_tbl, aes(x = reorder(model, -median), y = median)) +
+  geom_col(fill = "#4C72B0") +
+  geom_errorbar(aes(ymin = q1, ymax = q3), width = 0.3) +
+  geom_text(aes(label = formatC(median, digits = 2, format = "f")),
+            vjust = -0.6, size=3) +
+  labs(title = "Composite Skill Score Across Odisha Grid Points",
+       x = "CMIP6 Model", y = "Composite Score") +
+  theme_minimal(base_size = 12)
+
+
+# 9b. Taylor diagram of r, variability, and RMSD
+library(openair)
+library(RColorBrewer)
+
+# Prepare all_data ("long-form" with one obs/sim per row)
+openair_df <- all_data %>%
+  dplyr::select(model, obs = obs_rainfall, mod = sim_rainfall) %>%
+  drop_na(obs, mod, model)
+
+TaylorDiagram(
+  mydata   = openair_df,
+  obs      = "obs",
+  mod      = "mod",
+  group    = "model",
+  cols     = brewer.pal(length(unique(openair_df$model)), "Set1"),
+  pos.cor  = TRUE,
+  main     = "Taylor Diagram of CMIP6 Models"
+)
+
+print(taylor_df)
+summary(taylor_df)
+
+taylor_df <- taylor_df %>% drop_na(obs, mod, rmsd)
+
+print(taylor_df)
+str(taylor_df)
+
+
+# 9c. Monthly bias boxplots
+library(ggplot2)
+library(dplyr)
+
+# Calculate monthly bias for each grid and model
+monthly_bias <- all_data %>%
+  mutate(month = factor(month(yearMonth), levels = 1:12, labels = month.abb)) %>%
+  group_by(model, month) %>%
+  summarize(
+    median_bias = median(sim_rainfall - obs_rainfall, na.rm = TRUE),
+    mean_bias   = mean(sim_rainfall - obs_rainfall, na.rm = TRUE),
+    q1 = quantile(sim_rainfall - obs_rainfall, .25, na.rm = TRUE),
+    q3 = quantile(sim_rainfall - obs_rainfall, .75, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+ggplot(all_data, aes(x = model, y = sim_rainfall - obs_rainfall, fill = model)) +
+  geom_boxplot(outlier.size = 0.2, alpha = 0.7) +
+  geom_hline(yintercept = 0, color = "gray50", linetype = "dashed") +
+  facet_wrap(~ month, ncol = 4) +
+  coord_cartesian(ylim = c(-100, 100)) + # Adjust limits as needed
+  labs(title = "Monthly Rainfall Bias (Simulated – Observed) for Each Model",
+       x = "CMIP6 Model", y = "Bias (mm)") +
+  scale_fill_brewer(palette = "Set1") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+
+
+
+
+
+
+
+#Table 1: Performance Metrics Summary
+# Compute means (and SDs) of key metrics by model
+perf_summary <- metrics_table %>%
+  group_by(model) %>%
+  summarize(
+    r_mean     = mean(r, na.rm=TRUE),
+    bias_mean  = mean(bias, na.rm=TRUE),
+    rmse_mean  = mean(rmse, na.rm=TRUE),
+    mae_mean   = mean(mae, na.rm=TRUE),
+    nse_mean   = mean(nse, na.rm=TRUE),
+    pbias_mean = mean(pbias, na.rm=TRUE),
+    kge_mean   = mean(kge, na.rm=TRUE),
+    cvr_mean   = mean(cvr, na.rm=TRUE)
+  )
+knitr::kable(perf_summary, digits = 2, caption = "Table 1: Mean Performance Metrics by Model (1981–2014)")
+
+
+#Table 2: Seasonal Performance (Monsoon vs. Dry Season)
+all_data <- all_data %>%
+  mutate(season = case_when(
+    month(yearMonth) %in% 6:9  ~ "Monsoon",
+    month(yearMonth) %in% c(10,11,12,1,2,3) ~ "Dry",
+    TRUE ~ "Other"
+  ))
+metrics_season <- all_data %>%
+  group_by(model, season, Grid_Number) %>%
+  summarize(
+    r     = cor(sim_rainfall, obs_rainfall, use = "pairwise.complete.obs"),
+    bias  = mean(sim_rainfall - obs_rainfall, na.rm = TRUE),
+    rmse  = hydroGOF::rmse(obs_rainfall, sim_rainfall),
+    mae   = hydroGOF::mae(obs_rainfall, sim_rainfall),
+    nse   = hydroGOF::NSE(sim_rainfall, obs_rainfall),
+    pbias = hydroGOF::pbias(sim_rainfall, obs_rainfall),
+    kge   = hydroGOF::KGE(obs_rainfall, sim_rainfall)
+  ) %>%
+  ungroup() %>%
+  group_by(model, season) %>%
+  summarize(
+    r_mean     = mean(r, na.rm=TRUE),
+    bias_mean  = mean(bias, na.rm=TRUE),
+    rmse_mean  = mean(rmse, na.rm=TRUE),
+    mae_mean   = mean(mae, na.rm=TRUE),
+    nse_mean   = mean(nse, na.rm=TRUE),
+    pbias_mean = mean(pbias, na.rm=TRUE),
+    kge_mean   = mean(kge, na.rm=TRUE)
+  ) %>%
+  filter(season != "Other") %>%
+  arrange(model, season)
+knitr::kable(metrics_season, digits = 2, caption = "Table 2: Seasonal Performance Metrics by Model")
+
+
+
+
+ggsave("G:/Ph.D/Drought/CMIP6_work/Data/CMIP6_data/bar_composite_skill.png", width = 7, height = 5, dpi = 300)
+
+ggsave("G:/Ph.D/Drought/CMIP6_work/Data/CMIP6_data/taylor_diagram.png", width = 7, height = 7, dpi = 300)
+
+ggsave("G:/Ph.D/Drought/CMIP6_work/Data/CMIP6_data/monthly_bias_boxplot.png", width = 10, height = 8, dpi = 300)
+
+write_csv(perf_summary, "G:/Ph.D/Drought/CMIP6_work/Data/CMIP6_data/Table_1_Performance_Metrics.csv")
+
+write_csv(metrics_season, "G:/Ph.D/Drought/CMIP6_work/Data/CMIP6_data/Table_2_Seasonal_Metrics.csv")

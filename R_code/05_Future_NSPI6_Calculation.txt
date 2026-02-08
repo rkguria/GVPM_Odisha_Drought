@@ -1,0 +1,158 @@
+# ----------------------------------------------------------
+# Script: 05_Future_NSPI6_Calculation.R
+# Purpose: Compute future NSPI-6 for SSP2-4.5 and SSP5-8.5
+# Input data:
+#   - CMIP6_MME_rainfall.xlsx (future periods)
+# Output:
+#   - Future NSPI-6 time series
+#   - Drought severity classes (Moderate, Severe, Extreme)
+# Related manuscript section: 2.5
+# Author: Rajkumar Guria & Manoranjan Mishra
+# ----------------------------------------------------------
+
+
+#===============================
+# Future Drought Metrics (DF, ADD, ADS, ADI)
+#===============================
+
+# --- Required packages ---
+if (!requireNamespace("dplyr", quietly = TRUE)) install.packages("dplyr")
+if (!requireNamespace("readr", quietly = TRUE)) install.packages("readr")
+if (!requireNamespace("purrr", quietly = TRUE)) install.packages("purrr")
+
+library(dplyr)
+library(readr)
+library(purrr)
+
+# --- 1. Read CSV ---
+file_path <- "G:/Ph.D/Drought/Drought_population_exposer/Data/NSPI/NSPI_ssp585.csv"
+
+df <- read_csv(file_path,
+               col_types = cols(
+                 Grid_Number = col_character(),
+                 Date        = col_character(),
+                 NSPI_1      = col_double(),
+                 NSPI_3      = col_double(),
+                 NSPI_6      = col_double(),
+                 NSPI_9      = col_double(),
+                 NSPI_12     = col_double(),
+                 NSPI_24     = col_double(),
+                 NSPI_36     = col_double(),
+                 NSPI_48     = col_double()
+               ))
+
+# --- 2. Convert date and add year/month ---
+df <- df %>%
+  mutate(
+    Date  = as.Date(Date, format = "%m/%d/%Y"),
+    year  = as.integer(format(Date, "%Y")),
+    month = as.integer(format(Date, "%m"))
+  ) %>%
+  arrange(Grid_Number, Date)
+
+# --- 3. Function to detect drought events ---
+detect_events <- function(spi, dates, thresh = -1.0, min_len = 3) {
+  is_dry <- ifelse(is.na(spi), FALSE, spi < 0)
+  runs   <- rle(is_dry)
+  ends   <- cumsum(runs$lengths)
+  starts <- ends - runs$lengths + 1
+  
+  result <- list()
+  n_events <- 0
+  
+  for (k in seq_along(runs$values)) {
+    if (runs$values[k]) {
+      s <- starts[k]
+      e <- ends[k]
+      run_spi <- spi[s:e]
+      if (length(run_spi) >= min_len && any(run_spi <= thresh, na.rm = TRUE)) {
+        n_events <- n_events + 1
+        result[[n_events]] <- tibble(
+          start_date = dates[s],
+          end_date   = dates[e],
+          duration   = e - s + 1,
+          severity   = sum(run_spi, na.rm = TRUE),  # total SPI deficit
+          min_spi    = min(run_spi, na.rm = TRUE)
+        )
+      }
+    }
+  }
+  
+  if (n_events == 0) return(NULL)
+  bind_rows(result)
+}
+
+# --- 4. Define study periods ---
+periods <- list(
+  "2025-2049" = 2025:2049,
+  "2050-2074" = 2050:2074,
+  "2075-2100" = 2075:2100
+)
+
+nspi_scales <- c("NSPI_1", "NSPI_3", "NSPI_6", "NSPI_9",
+                 "NSPI_12", "NSPI_24", "NSPI_36", "NSPI_48")
+
+metrics_all <- list()
+
+# --- 5. Loop through periods and scales ---
+for (p_name in names(periods)) {
+  years <- periods[[p_name]]
+  
+  df_period <- df %>% filter(year %in% years)
+  
+  for (scale in nspi_scales) {
+    message("Processing ", scale, " for ", p_name, " ...")
+    
+    drought_metrics <- df_period %>%
+      group_by(Grid_Number) %>%
+      group_modify(~{
+        out <- detect_events(.x[[scale]], .x$Date, thresh = -1.0, min_len = 3)
+        
+        if (is.null(out)) {
+          tibble(
+            n_de_months = 0,
+            n_events    = 0,
+            DF          = 0,
+            ADD         = NA_real_,
+            ADS         = NA_real_,
+            ADI         = NA_real_
+          )
+        } else {
+          nde_months <- sum(out$duration)
+          n_events   <- nrow(out)
+          Nm         <- nrow(.x)
+          
+          DF  <- (nde_months / Nm) * 100
+          ADD <- mean(out$duration)
+          ADS <- mean(out$severity)
+          ADI <- ADS / ADD
+          
+          tibble(
+            n_de_months = nde_months,
+            n_events    = n_events,
+            DF          = DF,
+            ADD         = ADD,
+            ADS         = ADS,
+            ADI         = ADI
+          )
+        }
+      }) %>%
+      ungroup() %>%
+      mutate(scale = scale, period = p_name)
+    
+    metrics_all[[paste0(p_name, "_", scale)]] <- drought_metrics
+    
+    # Save each scale+period result
+    write_csv(
+      drought_metrics,
+      paste0("G:/Ph.D/Drought/Drought_population_exposer/Data/NSPI/NSPI_SSP585_", scale, "_", p_name, ".csv")
+    )
+  }
+}
+
+# --- 6. Combine all metrics ---
+combined_metrics <- bind_rows(metrics_all)
+write_csv(combined_metrics,
+          "G:/Ph.D/Drought/Drought_population_exposer/Data/NSPI/drought_metrics_future_SSP585.csv")
+
+message("✅ Future drought metrics calculated for all periods & scales.")
