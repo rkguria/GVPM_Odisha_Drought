@@ -1,7 +1,7 @@
 # Graph-based drought vulnerability propagation under climate change
 ## Coupling synchronization dynamics and population exposure in Odisha, India
 
-This repository contains all data and R scripts used in the manuscript:
+This repository contains the **R scripts** used in the manuscript:
 
 **Graph-based drought vulnerability propagation under climate change:  
 Coupling synchronization dynamics and population exposure in Odisha, India**
@@ -24,34 +24,35 @@ The workflow integrates:
 - Population exposure (person-event) analysis  
 - Graph-based vulnerability diffusion modelling  
 
-The repository enables full inspection and reproduction of the analyses presented in the manuscript.
+This repository enables full inspection and reproduction of the **methodological and modelling framework** presented in the manuscript.
 
 ---
 
-## 2. Data Description
+## 2. Data Availability and Description
 
 ### 2.1 Rainfall data
-- Bias-corrected monthly CMIP6 rainfall (five models: MPI-ESM1-2-HR, BCC-CSM2-MR, INM-CM5-0, EC-Earth3, NorESM2-MM)
-- Multi-model ensemble (MME) rainfall for SSP2-4.5 and SSP5-8.5 scenarios
+Processed, bias-corrected monthly CMIP6 rainfall data and derived multi-model ensemble (MME) rainfall for SSP2–4.5 and SSP5–8.5 scenarios are **archived on Zenodo**:
 
-Provided files:
-- `data/rainfall_bias_corrected/processed_rainfall_data.xlsx`  
-  (contains raw CMIP6 rainfall, IMD observations, and bias-corrected rainfall)
-- `data/rainfall_MME/CMIP6_MME_rainfall.xlsx`  
-  (final ensemble rainfall used for NSPI and GVPM)
+**https://doi.org/10.5281/zenodo.18523497**
 
-Raw CMIP6 NetCDF files are publicly available from the **Earth System Grid Federation (ESGF)** and are not redistributed here due to data volume and redistribution policies.
+The dataset includes:
+- Bias-corrected monthly precipitation from five CMIP6 models  
+  (MPI-ESM1-2-HR, BCC-CSM2-MR, INM-CM5-0, EC-Earth3, NorESM2-MM)
+- Multi-model ensemble (MME) rainfall used for NSPI and GVPM analysis
+
+Raw CMIP6 NetCDF outputs are publicly available from the **Earth System Grid Federation (ESGF)** and are not redistributed here due to data volume and redistribution policies.
 
 ---
 
 ### 2.2 Population data
-- Gridded population data from the **ISIMIP2b** protocol
-- Regridded from 0.5° to 0.25° spatial resolution
+Gridded population datasets derived from the **ISIMIP2b** protocol are also archived on Zenodo:
 
-Provided files:
-- `OD_Grid_Hist_pop_1981_2015.xlsx`
-- `OD_Grid_future_pop_2025_2100_SSP2.xlsx`
-- `OD_Grid_future_pop_2025_2100_SSP5.xlsx`
+**https://doi.org/10.5281/zenodo.18523497**
+
+These datasets include:
+- Historical population (1981–2015)
+- Future population projections (2025–2100) under SSP2 and SSP5  
+- All population data are regridded to 0.25° spatial resolution to match rainfall data
 
 ---
 
@@ -60,9 +61,11 @@ Provided files:
 All scripts are written in **R** and organized to follow the methodological workflow of the manuscript.
 
 Directory:
-R_code/
 
-Scripts are numbered and should be executed sequentially:
+
+Directory:
+
+Scripts should be executed sequentially:
 
 1. `01_Bias_Correction_CMIP6.R` – Bias correction of CMIP6 rainfall using quantile mapping  
 2. `02_CMIP6_Model_Evaluation.R` – Evaluation of CMIP6 rainfall against IMD observations  
@@ -75,32 +78,45 @@ Scripts are numbered and should be executed sequentially:
 9. `09_GVPM_Model.R` – Graph-based Vulnerability Propagation Model (GVPM)  
 10. `10_GVPM_Sensitivity_Analysis.R` – Sensitivity and uncertainty analysis  
 
-Each script includes a header specifying its purpose, input data, output, and corresponding manuscript section.
+Each script includes a header specifying its purpose, input data, outputs, and the corresponding manuscript section.
 
-
-
+---
 
 ## 4. Reproducibility
 
-All figures and tables presented in the manuscript can be reproduced by running the scripts in the `R_code/` directory using the data provided in `data/`.
+All figures and tables presented in the manuscript can be reproduced by:
+1. Downloading the processed datasets from Zenodo  
+   (https://doi.org/10.5281/zenodo.18523497)  
+2. Running the scripts in the `R_code/` directory sequentially
+
+---
 
 ## 5. Software Requirements
 
-R version ≥ 4.2  
-Key packages include: tidyverse, zoo, igraph, fitdistrplus, raster, sf, ncdf4
+- R version ≥ 4.2  
+- Key R packages:  
+  `tidyverse`, `zoo`, `igraph`, `fitdistrplus`, `raster`, `sf`, `ncdf4`
 
+---
 
 ## 6. License
 
-This repository is released under the **MIT License**.
+All R scripts in this repository are released under the **MIT License**.  
+The datasets archived on Zenodo are released under the **Creative Commons Attribution 4.0 International (CC BY 4.0)** license.
 
+---
 
 ## 7. Citation
 
-If you use this code or data, please cite the associated manuscript:
+### Dataset
+Guria, R., & Mishra, M. (2026).  
+*Processed rainfall and population datasets for graph-based drought vulnerability propagation analysis in Odisha, India* [Data set].  
+Zenodo. https://doi.org/10.5281/zenodo.18523497
+
+### Manuscript
+If you use this code, please cite the associated manuscript:
 
 Guria, R., & Mishra, M. (under review).  
 *Graph-based drought vulnerability propagation under climate change:  
 Coupling synchronization dynamics and population exposure in Odisha, India*.  
 Environmental Modelling & Software.
-
