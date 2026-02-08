@@ -83,3 +83,24 @@ Each script includes a header specifying its purpose, input data, output, and co
 ## 4. Reproducibility
 
 All figures and tables presented in the manuscript can be reproduced by running the scripts in the `R_code/` directory using the data provided in `data/`.
+
+## 5. Software Requirements
+
+R version ≥ 4.2  
+Key packages include: tidyverse, zoo, igraph, fitdistrplus, raster, sf, ncdf4
+
+
+## 6. License
+
+This repository is released under the **MIT License**.
+
+
+## 7. Citation
+
+If you use this code or data, please cite the associated manuscript:
+
+Guria, R., & Mishra, M. (under review).  
+*Graph-based drought vulnerability propagation under climate change:  
+Coupling synchronization dynamics and population exposure in Odisha, India*.  
+Environmental Modelling & Software.
+
