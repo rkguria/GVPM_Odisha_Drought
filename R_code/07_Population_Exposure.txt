@@ -1,0 +1,460 @@
+# ----------------------------------------------------------
+# Script: 07_Population_Exposure.R
+# Purpose: Estimate population exposure to drought using
+#          person-event methodology
+# Input data:
+#   - NSPI-6 drought events
+#   - ISIMIP2b population grids (historical & SSPs)
+# Output:
+#   - Population exposure (person-events)
+#   - Climate, population, and interaction decomposition
+# Related manuscript section: 2.7
+# Author: Rajkumar Guria & Manoranjan Mishra
+# ----------------------------------------------------------
+
+## =======
+## Step 0: Libraries & Helpers
+## =======
+library(readr)
+library(dplyr)
+library(lubridate)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(scales)
+
+safe_read_csv <- function(path) {
+  enc <- tryCatch(readr::guess_encoding(path), error = function(e) NULL)
+  enc_name <- if (!is.null(enc) && nrow(enc) > 0) enc$encoding[1] else "UTF-8"
+  tryCatch(
+    read_csv(path, locale = locale(encoding = enc_name), show_col_types = FALSE),
+    error = function(e) {
+      tryCatch(read_csv(path, locale = locale(encoding = "UTF-8-BOM"), show_col_types = FALSE),
+               error = function(e2) read_csv(path, locale = locale(encoding = "latin1"), show_col_types = FALSE))
+    }
+  )
+}
+
+parse_mdY <- function(x) {
+  y <- suppressWarnings(dmy(x))
+  y[is.na(y)] <- suppressWarnings(mdy(x[is.na(y)]))
+  y
+}
+
+auto_rename <- function(df, expected, possible) {
+  match <- intersect(names(df), possible)
+  if (length(match) == 1) names(df)[names(df) == match] <- expected
+  df
+}
+
+## =======
+## Step 1: Odisha grid reference
+## =======
+grid_file <- "G:/Ph.D/Drought/Drought_population_exposer/Data/Population_exposer/Odisha_215_Grid_Lat_Long.csv"
+odisha_grid <- safe_read_csv(grid_file) %>%
+  auto_rename("Grid_Number", c("Grid_Number", "Grid_Numbe", "grid_id", "grid")) %>%
+  distinct(Grid_Number, .keep_all = TRUE)
+
+## =======
+## Step 2: Historical Population
+## =======
+hist_pop_file <- "G:/Ph.D/Drought/Drought_population_exposer/Data/Population_exposer/OD_Grid_Hist_pop_1981_2015.csv"
+hist_pop <- safe_read_csv(hist_pop_file) %>%
+  auto_rename("Grid_Number", c("Grid_Number", "Grid_Numbe", "grid_id")) %>%
+  auto_rename("Pop", c("Pop", "Population", "pop_hist")) %>%
+  select(Grid_Number, Pop_hist = Pop)
+
+## =======
+## Step 3: Future SSP2 Population (robust detection for your format)
+## =======
+
+future_pop_file <- "G:/Ph.D/Drought/Drought_population_exposer/Data/Population_exposer/OD_Grid_future_pop_2025_2100_SSP5.csv"
+future_pop_raw <- safe_read_csv(future_pop_file) %>%
+  auto_rename("Grid_Number", c("Grid_Number", "Grid_Numbe", "grid_id"))
+
+# Detect columns for new ranges
+col_2025 <- names(future_pop_raw)[str_detect(names(future_pop_raw), "2025")]
+col_2063 <- names(future_pop_raw)[str_detect(names(future_pop_raw), "2063")]
+
+if (length(col_2025) == 1 && length(col_2063) == 1) {
+  future_pop <- future_pop_raw %>%
+    rename(Pop_2025_2062 = all_of(col_2025),
+           Pop_2063_2100 = all_of(col_2063)) %>%
+    select(Grid_Number, Pop_2025_2062, Pop_2063_2100)
+} else {
+  stop("Could not detect the two period columns (2025–2062, 2063–2100) in the future population file.")
+}
+
+
+## =======
+## Step 4: Historical NSPI (1981–2014)
+## =======
+hist_nspi_file <- "G:/Ph.D/Drought/Drought_population_exposer/Data/Population_exposer/NSPI_obs_multi_scale_1981_2014.csv"
+hist_nspi <- safe_read_csv(hist_nspi_file) %>%
+  auto_rename("Grid_Number", c("Grid_Number", "Grid_Numbe", "grid_id")) %>%
+  auto_rename("yearMonth", c("yearMonth", "YearMonth", "date", "Date", "time")) %>%
+  auto_rename("NSPI_6", c("NSPI_6", "nspi6", "SPI6")) %>%
+  mutate(Date = parse_mdY(yearMonth),
+         Period = "Historical") %>%
+  filter(!is.na(NSPI_6))
+
+
+## =======
+## Step 5: Future NSPI SSP2 (2015–2100 -> 2 windows)
+## =======
+future_nspi_file <- "G:/Ph.D/Drought/Drought_population_exposer/Data/Population_exposer/NSPI_ssp245.csv"
+future_nspi <- safe_read_csv(future_nspi_file) %>%
+  auto_rename("Grid_Number", c("Grid_Number", "Grid_Numbe", "grid_id")) %>%
+  auto_rename("Date", c("Date", "date", "time")) %>%
+  auto_rename("NSPI_6", c("NSPI_6", "nspi6", "SPI6")) %>%
+  mutate(Date = parse_mdY(Date),
+         Year = year(Date),
+         Period = case_when(
+           Year >= 2025 & Year <= 2062 ~ "2025_2062",
+           Year >= 2063 & Year <= 2100 ~ "2063_2100",
+           TRUE ~ NA_character_
+         )) %>%
+  filter(!is.na(Period), !is.na(NSPI_6)) %>%
+  select(-Year)
+
+
+## =======
+## Step 6: Drought classification
+## =======
+classify_drought <- function(nspi6) {
+  case_when(
+    nspi6 <= -2.0 ~ "Extreme",
+    nspi6 <= -1.5 ~ "Severe",
+    nspi6 <= -1.0 ~ "Moderate",
+    TRUE          ~ "No_Drought"
+  )
+}
+hist_nspi  <- hist_nspi  %>% mutate(Severity = classify_drought(NSPI_6))
+future_nspi <- future_nspi %>% mutate(Severity = classify_drought(NSPI_6))
+
+## =======
+## Step 7: Count drought months per grid/period/severity
+## =======
+count_drought_months <- function(df) {
+  df %>%
+    group_by(Grid_Number, Period, Severity) %>%
+    summarise(Drought_Months = n(), .groups = "drop") %>%
+    filter(Severity != "No_Drought")
+}
+hist_counts <- count_drought_months(hist_nspi)
+fut_counts  <- count_drought_months(future_nspi)
+
+## =======
+## Step 8: Population exposure (person-months)
+## =======
+# Historical
+hist_exposure <- hist_counts %>%
+  left_join(hist_pop, by = "Grid_Number") %>%
+  mutate(Exposure = Drought_Months * Pop_hist)
+
+# Future (map population by period)
+future_exposure <- fut_counts %>%
+  left_join(future_pop, by = "Grid_Number") %>%
+  mutate(Pop_future = case_when(
+    Period == "2025_2062" ~ Pop_2025_2062,
+    Period == "2063_2100" ~ Pop_2063_2100,
+    TRUE ~ NA_real_
+  ),
+  Exposure = Drought_Months * Pop_future)
+
+## =======
+## Step 9: Probability Ratio (PR)
+## =======
+hist_total_months <- hist_nspi %>%
+  group_by(Grid_Number) %>%
+  summarise(TotalMonths = n(), .groups = "drop")
+
+fut_total_months <- future_nspi %>%
+  group_by(Grid_Number, Period) %>%
+  summarise(TotalMonths = n(), .groups = "drop")
+
+hist_probs <- hist_counts %>%
+  left_join(hist_total_months, by = "Grid_Number") %>%
+  mutate(Prob_hist = ifelse(TotalMonths > 0, Drought_Months / TotalMonths, NA_real_))
+
+fut_probs <- fut_counts %>%
+  left_join(fut_total_months, by = c("Grid_Number","Period")) %>%
+  mutate(Prob_future = ifelse(TotalMonths > 0, Drought_Months / TotalMonths, NA_real_))
+
+pr_df <- fut_probs %>%
+  left_join(hist_probs %>% select(Grid_Number, Severity, Prob_hist),
+            by = c("Grid_Number","Severity")) %>%
+  mutate(PR = ifelse(!is.na(Prob_hist) & Prob_hist > 0, Prob_future / Prob_hist, NA_real_))
+
+## =======
+## Step 10: Attribution (Climate, Population, Interaction)
+## =======
+hist_exposure2 <- hist_exposure %>%
+  mutate(Period = "Historical") %>%
+  rename(Drought_Months_hist = Drought_Months,
+         Exposure_hist = Exposure)
+
+future_exposure2 <- future_exposure %>%
+  rename(Drought_Months_future = Drought_Months,
+         Exposure_future = Exposure)
+
+attrib_grid <- future_exposure2 %>%
+  left_join(hist_exposure2 %>% select(Grid_Number, Severity, Drought_Months_hist, Pop_hist, Exposure_hist),
+            by = c("Grid_Number","Severity")) %>%
+  mutate(
+    Dh = Drought_Months_hist,
+    Df = Drought_Months_future,
+    Ph = Pop_hist,
+    Pf = Pop_future,
+    deltaD = Df - Dh,
+    deltaP = Pf - Ph,
+    Climate_eff     = Ph * deltaD,
+    Population_eff  = Dh * deltaP,
+    Interaction_eff = deltaD * deltaP,
+    Exposure_change = Exposure_future - Exposure_hist
+  )
+
+attribution_df <- attrib_grid %>%
+  group_by(Period, Severity) %>%
+  summarise(
+    Climate      = sum(Climate_eff, na.rm = TRUE),
+    Population   = sum(Population_eff, na.rm = TRUE),
+    Interaction  = sum(Interaction_eff, na.rm = TRUE),
+    TotalChange  = sum(Exposure_change, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Climate_pc     = ifelse(TotalChange != 0, 100 * Climate / TotalChange, NA_real_),
+    Population_pc  = ifelse(TotalChange != 0, 100 * Population / TotalChange, NA_real_),
+    Interaction_pc = ifelse(TotalChange != 0, 100 * Interaction / TotalChange, NA_real_)
+  )
+
+## =======
+## Step 11: Odisha-wide summaries
+## =======
+
+exposure_summary <- bind_rows(
+  hist_exposure %>% mutate(Period = "Historical"),
+  future_exposure
+) %>%
+  group_by(Period, Severity) %>%
+  summarise(Exposure = sum(Exposure, na.rm = TRUE), .groups = "drop")
+
+
+
+exposure_summary$Period  <- factor(exposure_summary$Period,
+                                   levels = c("Historical", "2025_2062", "2063_2100"))
+exposure_summary$Severity<- factor(exposure_summary$Severity,
+                                   levels = c("Moderate","Severe","Extreme"))
+
+pr_df$Period   <- factor(pr_df$Period,   levels = c("2025_2062","2063_2100"))
+pr_df$Severity <- factor(pr_df$Severity, levels = c("Moderate","Severe","Extreme"))
+
+
+
+
+
+
+
+
+exposure_summary <- bind_rows(
+  hist_exposure %>% mutate(Period = "Historical"),
+  future_exposure
+) %>%
+  group_by(Period, Severity) %>%
+  summarise(Exposure = sum(Exposure, na.rm = TRUE), .groups = "drop")
+
+pr_summary <- pr_df %>%
+  group_by(Period, Severity) %>%
+  summarise(PR_median = median(PR, na.rm = TRUE),
+            PR_mean   = mean(PR, na.rm = TRUE),
+            .groups = "drop")
+
+
+
+## =======
+## Step 12: Sanity checks (optional)
+## =======
+message("Rows hist_pop: ", nrow(hist_pop))
+message("Rows future_pop: ", nrow(future_pop))
+message("Rows hist_nspi: ", nrow(hist_nspi))
+message("Rows future_nspi: ", nrow(future_nspi))
+message("Rows hist_counts: ", nrow(hist_counts))
+message("Rows fut_counts: ", nrow(fut_counts))
+
+future_exposure %>%
+  summarise(
+    missing_pop_future = sum(is.na(Pop_future)),
+    missing_exposure = sum(is.na(Exposure))
+  )
+
+hist_prob_check <- hist_probs %>%
+  group_by(Grid_Number) %>%
+  summarise(prob_sum = sum(Prob_hist, na.rm = TRUE), .groups = "drop")
+summary(hist_prob_check$prob_sum)
+summary(pr_df$PR)
+sum(is.na(pr_df$PR))
+
+attribution_df %>%
+  mutate(check_sum = Climate + Population + Interaction) %>%
+  summarise(
+    max_abs_diff = max(abs(check_sum - TotalChange), na.rm = TRUE)
+  )
+
+hist_counts %>% filter(Grid_Number == "Grid_1")
+fut_counts  %>% filter(Grid_Number == "Grid_1")
+hist_exposure %>% filter(Grid_Number == "Grid_1")
+future_exposure %>% filter(Grid_Number == "Grid_1")
+
+## =======
+## Step 13: Save all outputs (tables as CSV, figures as PDF) to one folder
+## =======
+out_dir <- "G:/Ph.D/Drought/Drought_population_exposer/New_population_exposer/Outputs_Exposer_Odisha"
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+# Tables (CSV)
+write_csv(hist_counts,        file.path(out_dir, "hist_counts_by_grid_severity.csv"))
+write_csv(fut_counts,         file.path(out_dir, "future_counts_by_grid_severity.csv"))
+write_csv(hist_exposure,      file.path(out_dir, "hist_exposure_person_months_by_grid.csv"))
+write_csv(future_exposure,    file.path(out_dir, "future_exposure_person_months_by_grid.csv"))
+write_csv(exposure_summary,   file.path(out_dir, "exposure_summary_statewide.csv"))
+write_csv(pr_df,              file.path(out_dir, "probability_ratio_by_grid.csv"))
+write_csv(pr_summary,         file.path(out_dir, "probability_ratio_summary_statewide.csv"))
+write_csv(attribution_df,     file.path(out_dir, "attribution_summary_statewide.csv"))
+
+
+
+#calculated this comparison_exposure_with_attribution Table
+
+# 1️⃣ Historical exposure by Severity
+exp_hist <- exposure_summary %>%
+  filter(Period == "Historical") %>%
+  select(Severity, Exposure_hist = Exposure)
+
+# 2️⃣ Future exposure by Period and Severity
+exp_future <- exposure_summary %>%
+  filter(Period != "Historical") %>%
+  select(Period, Severity, Exposure_future = Exposure)
+
+# 3️⃣ Merge historical with future exposures
+comp_table <- exp_future %>%
+  left_join(exp_hist, by = "Severity") %>%
+  mutate(
+    Delta_Exposure = Exposure_future - Exposure_hist,
+    Pct_Change = ifelse(Exposure_hist > 0,
+                        100 * Delta_Exposure / Exposure_hist,
+                        NA_real_)
+  )
+
+# 4️⃣ Add attribution shares (from attribution_df)
+attrib_shares <- attribution_df %>%
+  select(Period, Severity, Climate_pc, Population_pc, Interaction_pc)
+
+comp_table_with_attr <- comp_table %>%
+  left_join(attrib_shares, by = c("Period","Severity")) %>%
+  arrange(Severity, Period)
+
+# 5️⃣ Save CSV
+write_csv(comp_table_with_attr, file.path(out_dir, "comparison_exposure_with_attribution.csv"))
+
+# Optional: nicely formatted table for reporting
+comp_table_print <- comp_table_with_attr %>%
+  mutate(
+    Exposure_hist    = scales::comma(Exposure_hist),
+    Exposure_future  = scales::comma(Exposure_future),
+    Delta_Exposure   = scales::comma(Delta_Exposure),
+    Pct_Change       = sprintf("%.1f%%", Pct_Change),
+    Climate_pc       = sprintf("%.1f%%", Climate_pc),
+    Population_pc    = sprintf("%.1f%%", Population_pc),
+    Interaction_pc   = sprintf("%.1f%%", Interaction_pc)
+  )
+
+write_csv(comp_table_print, file.path(out_dir, "comparison_exposure_with_attribution_formatted.csv"))
+
+
+
+
+
+
+# 1) Odisha-wide bar charts of exposure by severity and window
+# 1) Odisha-wide bar charts of exposure by severity and window
+exposure_summary$Period  <- factor(exposure_summary$Period,
+                                   levels = c("Historical", "2025_2062", "2063_2100"))
+exposure_summary$Severity<- factor(exposure_summary$Severity,
+                                   levels = c("Moderate","Severe","Extreme"))
+
+p_exposure_bars <- ggplot(exposure_summary, aes(x = Period, y = Exposure/1e6, fill = Severity)) +
+  geom_col(position = "dodge") +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "Odisha population exposure (person-months) by severity and period",
+       x = "Period",
+       y = "Exposure (million person-months)",
+       fill = "Severity") +
+  theme_minimal(base_size = 12)
+
+print(p_exposure_bars)
+
+# Save figures
+ggsave(filename = file.path(out_dir, "exposure_bar_severity_period.pdf"),
+       plot = p_exposure_bars, width = 9, height = 5)
+ggsave(filename = file.path(out_dir, "exposure_bar_severity_period.png"),
+       plot = p_exposure_bars, width = 9, height = 5, dpi = 300)
+
+
+# 2) Comparison table: historical vs future exposure with %change and attribution shares
+exp_hist <- exposure_summary %>%
+  filter(Period == "Historical") %>%
+  select(Severity, Exposure_hist = Exposure)
+
+exp_future <- exposure_summary %>%
+  filter(Period != "Historical") %>%
+  select(Period, Severity, Exposure_future = Exposure)
+
+comp_table <- exp_future %>%
+  left_join(exp_hist, by = "Severity") %>%
+  mutate(Delta_Exposure = Exposure_future - Exposure_hist,
+         Pct_Change = ifelse(Exposure_hist > 0, 100 * Delta_Exposure / Exposure_hist, NA_real_))
+
+attrib_shares <- attribution_df %>%
+  select(Period, Severity, Climate_pc, Population_pc, Interaction_pc)
+
+comp_table_with_attr <- comp_table %>%
+  left_join(attrib_shares, by = c("Period","Severity")) %>%
+  arrange(Severity, Period)
+
+# Save comparison tables
+write_csv(comp_table_with_attr, file.path(out_dir, "comparison_exposure_with_attribution.csv"))
+
+comp_table_print <- comp_table_with_attr %>%
+  mutate(
+    Exposure_hist    = comma(Exposure_hist),
+    Exposure_future  = comma(Exposure_future),
+    Delta_Exposure   = comma(Delta_Exposure),
+    Pct_Change       = sprintf("%.1f%%", Pct_Change),
+    Climate_pc       = sprintf("%.1f%%", Climate_pc),
+    Population_pc    = sprintf("%.1f%%", Population_pc),
+    Interaction_pc   = sprintf("%.1f%%", Interaction_pc)
+  )
+
+write_csv(comp_table_print, file.path(out_dir, "comparison_exposure_with_attribution_formatted.csv"))
+
+# 3) Optional PR violin + box plots
+# 3) Optional PR violin + box plots
+pr_df$Period   <- factor(pr_df$Period,   levels = c("2025_2062","2063_2100"))
+pr_df$Severity <- factor(pr_df$Severity, levels = c("Moderate","Severe","Extreme"))
+
+p_pr_violin <- ggplot(pr_df, aes(x = Period, y = PR, fill = Severity)) +
+  geom_violin(alpha = 0.5, position = position_dodge(width = 0.8), trim = TRUE) +
+  geom_boxplot(width = 0.12, position = position_dodge(width = 0.8), outlier.size = 0.6) +
+  scale_y_continuous(limits = c(0, NA)) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "Probability Ratio (PR) by period and severity (Odisha, grid-wise)",
+       x = "Period", y = "PR = P_future / P_hist", fill = "Severity") +
+  theme_minimal(base_size = 12)
+
+print(p_pr_violin)
+
+ggsave(filename = file.path(out_dir, "PR_violin_box_severity_period.pdf"),
+       plot = p_pr_violin, width = 9, height = 5.5)
+ggsave(filename = file.path(out_dir, "PR_violin_box_severity_period.png"),
+       plot = p_pr_violin, width = 9, height = 5.5, dpi = 300)

@@ -1,0 +1,215 @@
+# ----------------------------------------------------------
+# Script: 09_GVPM_Model.R
+# Purpose: Implement the Graph-based Vulnerability
+#          Propagation Model (GVPM)
+# Input data:
+#   - Drought synchronization network
+#   - Population exposure metrics
+# Output:
+#   - Spatial vulnerability maps
+#   - Vulnerability scores (Low–Very High)
+# Related manuscript section: 2.8
+# Author: Rajkumar Guria & Manoranjan Mishra
+# ----------------------------------------------------------
+
+
+# ============================================================
+# Graph-Based Vulnerability Propagation Model (GVPM)
+# Future Scenario: SSP5  (Period P1: 2025_2062)
+# ============================================================
+
+# ------------------------------------------------------------
+# 0) Load Required Libraries
+# ------------------------------------------------------------
+library(tidyverse)
+library(igraph)
+library(viridis)
+
+# ------------------------------------------------------------
+# 1) Load Input Data
+# ------------------------------------------------------------
+centrality_data <- read_csv("G:/Ph.D/Drought/CMIP6_work/Results/SSP5/P1/drought_network_metrics.csv")
+exposure_data   <- read_csv("G:/Ph.D/Drought/Drought_population_exposer/New_population_exposer/Outputs_Exposer_Odisha/SSP5/future_exposure_person_months_by_grid.csv")
+network_data    <- read_csv("G:/Ph.D/Drought/CMIP6_work/Results/SSP5/P1/edges_synchronization_directed.csv")
+
+# ------------------------------------------------------------
+# 2) Filter Required Period (Future: 2025–2062)
+# ------------------------------------------------------------
+exposure_data <- exposure_data %>% filter(Period == "2025_2062")
+
+# ------------------------------------------------------------
+# 3) Ensure Consistent Node Identifiers
+# ------------------------------------------------------------
+exposure_data <- exposure_data %>%
+  mutate(Grid_Number = as.character(Grid_Number))
+
+network_data  <- network_data %>%
+  mutate(from = paste0("Grid_", as.character(from)),
+         to   = paste0("Grid_", as.character(to)))
+
+centrality_data <- centrality_data %>%
+  mutate(Grid = paste0("Grid_", as.character(Grid)))
+
+# ------------------------------------------------------------
+# 4) Build Weighted and Normalized Adjacency Matrix (W)
+# ------------------------------------------------------------
+nodes <- sort(unique(c(network_data$from, network_data$to)))
+W <- matrix(0, nrow = length(nodes), ncol = length(nodes),
+            dimnames = list(nodes, nodes))
+
+# Fill matrix with directed weights (j → i)
+for(k in seq_len(nrow(network_data))) {
+  i <- network_data$to[k]    # receiver
+  j <- network_data$from[k]  # sender
+  W[i, j] <- network_data$weight[k]
+}
+
+# ---- Global rescaling (Eq. 18)
+wmax <- max(W)
+if(is.finite(wmax) && wmax > 0) W <- W / wmax
+
+# ---- Column normalization (Eq. 19)
+col_sums <- colSums(W)
+col_sums[col_sums == 0] <- 1  # avoid division by zero
+W <- sweep(W, 2, col_sums, "/")
+
+# ------------------------------------------------------------
+# 5) Compute Initial Vulnerability (V0)
+# ------------------------------------------------------------
+
+# Severity weights: (moderate=1, severe=2, extreme=3)
+severity_wt <- c(Moderate = 1.0, Severe = 2.0, Extreme = 3.0)
+
+initial_vuln <- exposure_data %>%
+  group_by(Grid_Number) %>%
+  summarise(
+    TotalExposure = sum(Exposure),
+    RawScore      = sum(Drought_Months * severity_wt[Severity]),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    # ---- Min–max normalization (Eq. 21)
+    Exp_mm = if(max(TotalExposure) > min(TotalExposure))
+      (TotalExposure - min(TotalExposure)) / (max(TotalExposure) - min(TotalExposure)) else 0,
+    Raw_mm = if(max(RawScore) > min(RawScore))
+      (RawScore - min(RawScore)) / (max(RawScore) - min(RawScore)) else 0,
+    # ---- Initial vulnerability (Eq. 22)
+    InitialV = pmin(1, pmax(0, 0.5 * Exp_mm + 0.5 * Raw_mm + 1e-6))
+  ) %>%
+  select(Grid_Number, InitialV)
+
+# ---- Map to all grid nodes
+init_vec <- initial_vuln %>%
+  inner_join(centrality_data %>% select(Grid), by = c("Grid_Number" = "Grid")) %>%
+  select(Grid_Number, InitialV) %>%
+  deframe()
+
+# Full vector with zeros for missing nodes
+all_ids <- colnames(W)
+V0 <- rep(0, length(all_ids)); names(V0) <- all_ids
+present <- intersect(names(V0), names(init_vec))
+V0[present] <- init_vec[present]
+
+# ------------------------------------------------------------
+# 6) Influence Matrix with Betweenness Weighting (Eq. 23)
+# ------------------------------------------------------------
+BC_vec <- centrality_data %>% select(Grid, Betweenness) %>% deframe()
+BC_vec <- BC_vec[all_ids]; BC_vec[is.na(BC_vec)] <- 0
+
+bc_max <- max(BC_vec)
+if(is.finite(bc_max) && bc_max > 0) BC_vec <- BC_vec / bc_max
+
+# Weighted influence matrix M = BC_norm(j) × W(i,j)
+M <- sweep(W, 2, BC_vec, "*")
+
+# ------------------------------------------------------------
+# 7) Propagation Dynamics (Eq. 24–25)
+# ------------------------------------------------------------
+# Convex (bounded) diffusion update:
+# V_{t+1} = (1 - α) * V_t + α * (M %*% V_t)
+
+propagate <- function(M, V0, alpha = 0.25, steps = 12, clamp = TRUE) {
+  n <- length(V0)
+  out <- matrix(0, nrow = n, ncol = steps + 1,
+                dimnames = list(names(V0), paste0("t", 0:steps)))
+  out[, "t0"] <- V0
+  Vt <- V0
+
+  for(t in seq_len(steps)) {
+    inflow <- as.numeric(M %*% Vt)
+    Vt_new <- (1 - alpha) * Vt + alpha * inflow  # convex update
+    if(clamp) Vt_new <- pmin(pmax(Vt_new, 0), 1) # keep within [0,1]
+    out[, paste0("t", t)] <- Vt_new
+    Vt <- Vt_new
+  }
+  return(out)
+}
+
+alpha <- 0.25  # propagation rate
+steps <- 12    # one hydrological year (monthly updates)
+
+V_ts <- propagate(M, V0, alpha, steps)
+
+
+# ------------------------------------------------------------
+# 7b) Sensitivity check for number of iterations (T = 6, 12, 24)
+# ------------------------------------------------------------
+
+alph <- 0.25
+T_values <- c(6, 12, 24)
+
+sensitivity_results <- list()
+
+for (T_val in T_values) {
+  V_temp <- propagate(M, V0, alpha = alph, steps = T_val)
+  Final_temp <- V_temp[, ncol(V_temp)]
+  sensitivity_results[[paste0("T", T_val)]] <- Final_temp
+}
+
+# Convert to data frame for quick comparison
+sens_df <- as_tibble(sensitivity_results) %>%
+  mutate(Grid = names(V0)) %>%
+  relocate(Grid)
+
+# Compute correlations between results for different T
+cor_T12_T6  <- cor(sens_df$T12, sens_df$T6,  use = "pairwise.complete.obs")
+cor_T12_T24 <- cor(sens_df$T12, sens_df$T24, use = "pairwise.complete.obs")
+
+cat("\nSensitivity correlations:\n")
+cat("  Corr(T=12 vs T=6)  =", round(cor_T12_T6,  3), "\n")
+cat("  Corr(T=12 vs T=24) =", round(cor_T12_T24, 3), "\n")
+
+# Optional: save for plotting or GIS
+write_csv(sens_df, paste0(out_path, "GVPM_T_sensitivity_results.csv"))
+
+
+# ------------------------------------------------------------
+# 8) Outputs and Save
+# ------------------------------------------------------------
+FinalV <- V_ts[, ncol(V_ts)]
+
+final_vuln <- tibble(
+  Grid   = rownames(V_ts),
+  FinalV = as.numeric(FinalV)
+) %>%
+  left_join(
+    centrality_data %>% select(Grid, lon, lat),
+    by = "Grid"
+  )
+
+# Quick preview
+print(head(final_vuln, 20))
+summary(FinalV)
+
+# ---- Save results
+out_path <- "G:/Ph.D/Drought/Drought_population_exposer/Graph-Based Vulnerability Propagation Model/New_vulnerability/Future/"
+
+write_csv(as_tibble(V_ts, rownames = "Grid"),
+          paste0(out_path, "Vulnerability_Timeseries_P1_SSP5.csv"))
+
+write_csv(final_vuln,
+          paste0(out_path, "Final_Vulnerability_P1_SSP5.csv"))
+
+# ============================================================
+# End of Script
+# ============================================================

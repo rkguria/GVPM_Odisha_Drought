@@ -1,0 +1,210 @@
+# ----------------------------------------------------------
+# Script: 06_Event_Synchronization_Network.R
+# Purpose: Construct drought propagation networks using
+#          event synchronization and compute network metrics
+# Input data:
+#   - NSPI-6 drought onset events
+# Output:
+#   - Synchronization matrix
+#   - Network metrics (DC, BC, CC, ASD)
+#   - Drought hub classification
+# Related manuscript section: 2.6
+# Author: Rajkumar Guria & Manoranjan Mishra
+# ----------------------------------------------------------
+
+
+#================================================================================
+# Future Period Drought Propagation Network Analysis
+#================================================================================
+
+library(tidyverse)
+library(lubridate)
+library(igraph)
+library(parallel)
+library(geosphere)
+
+#-------------------------------
+# Parameters
+#-------------------------------
+csv_path <- "G:/Ph.D/Drought/CMIP6_work/Data/CMIP6_data/Future_Bias_Corrected/NSPI_ssp585.csv"
+grid_coords_path <- "G:/Ph.D/Drought/Drought_population_exposer/Data/Population_exposer/Odisha_215_Grid_Lat_Long.csv"
+
+onset_scale <- "NSPI_6"
+drought_threshold <- -1
+sync_lag <- 3           # max time lag in months
+sync_thresh <- 0.1      # threshold for significant synchronization
+
+# Define future periods
+periods <- list(
+  P1 = c(2025, 2062),
+  P2 = c(2063, 2100)
+)
+
+#-------------------------------
+# Read data
+#-------------------------------
+nspi_df_all <- read_csv(csv_path) %>%
+  mutate(
+    Date = as.Date(Date, format = "%d/%m/%Y"),
+    Grid = sub("^Grid_", "", Grid_Number)  # remove "Grid_" to match later
+  )
+
+# Ensure numeric NSPI columns
+nspi_cols <- paste0("NSPI_", c(1,3,6,9,12,24,36,48))
+nspi_df_all[nspi_cols] <- lapply(nspi_df_all[nspi_cols], as.numeric)
+
+# Read grid coordinates and unify naming
+grid_coords <- read_csv(grid_coords_path) %>%
+  rename(Grid = Grid_Number, Lon = Longitude, Lat = Latitude) %>%
+  mutate(Grid = sub("Grid_", "", Grid))  # remove "Grid_" to match `grids`
+
+#-------------------------------
+# Loop over periods
+#-------------------------------
+for (period_name in names(periods)) {
+  
+  years <- periods[[period_name]]
+  message("\n=== Processing period ", years[1], "-", years[2], " ===")
+  
+  # Filter data for the period
+  nspi_df <- nspi_df_all %>%
+    filter(year(Date) >= years[1] & year(Date) <= years[2])
+  
+  # Detect drought onsets
+  detect_onsets <- function(df, scale, threshold) {
+    df <- df[order(df$Date), ]
+    drought <- !is.na(df[[scale]]) & df[[scale]] <= threshold
+    onset <- drought & c(FALSE, head(drought, -1) == FALSE)
+    df[onset, c("Grid", "Date")]
+  }
+  
+  drought_onsets <- do.call(rbind,
+                            lapply(split(nspi_df, nspi_df$Grid), function(subdf) {
+                              detect_onsets(subdf, onset_scale, drought_threshold)
+                            }))
+  
+  onset_list <- drought_onsets %>%
+    group_by(Grid) %>%
+    summarize(Events = list(Date), .groups = "drop") %>%
+    deframe()
+  
+  grids <- names(onset_list)
+  n <- length(grids)
+  
+  #-------------------------------
+  # Synchronization matrix
+  #-------------------------------
+  event_sync <- function(di, dj, tau) {
+    if(length(di)==0 || length(dj)==0) return(0)
+    Ci_j <- sum(sapply(di, function(ti)
+      sum(dj > ti & difftime(dj, ti, units="days")/30.44 <= tau)
+    ))
+    Cj_i <- sum(sapply(dj, function(tj)
+      sum(di > tj & difftime(di, tj, units="days")/30.44 <= tau)
+    ))
+    denom <- sqrt(length(di) * length(dj))
+    (Ci_j + Cj_i) / ifelse(denom > 0, denom, 1)
+  }
+  
+  cl <- makeCluster(detectCores() - 1)
+  clusterExport(cl, varlist = c("onset_list", "event_sync", "sync_lag", "n"))
+  sync_matrix <- parSapply(cl, 1:n, function(i) {
+    sapply(1:n, function(j) event_sync(onset_list[[i]], onset_list[[j]], sync_lag))
+  })
+  stopCluster(cl)
+  
+  rownames(sync_matrix) <- grids
+  colnames(sync_matrix) <- grids
+  
+  #-------------------------------
+  # Average Synchronization Density (ASD)
+  #-------------------------------
+  asd_values <- apply(sync_matrix, 1, function(row) {
+    sum_sync <- sum(row, na.rm = TRUE)
+    sum_j <- length(row)
+    sum_sync / sum_j
+  })
+  
+  asd_df <- tibble(Grid = grids, ASD = asd_values)
+  
+  #-------------------------------
+  # Build directed network
+  #-------------------------------
+  adj_mat <- ifelse(sync_matrix > sync_thresh, sync_matrix, 0)
+  diag(adj_mat) <- 0
+  drought_net <- graph_from_adjacency_matrix(adj_mat, mode = "directed", weighted = TRUE)
+  
+  #-------------------------------
+  # Compute network metrics
+  #-------------------------------
+  metrics <- tibble(
+    Grid = grids,
+    Degree = degree(drought_net, mode = "all"),
+    InDegree = degree(drought_net, mode = "in"),
+    OutDegree = degree(drought_net, mode = "out"),
+    Betweenness = betweenness(drought_net, directed = TRUE, normalized = TRUE),
+    Clustering = transitivity(drought_net, type = "local") %>% replace_na(0),
+    Closeness = closeness(drought_net, mode = "all", normalized = TRUE),
+    Eigenvector = eigen_centrality(drought_net, directed = TRUE)$vector,
+    PageRank = page_rank(drought_net)$vector,
+    ASD = asd_values
+  )
+  
+  metrics <- metrics %>%
+    mutate_at(vars(Degree, Betweenness, Eigenvector, PageRank),
+              ~ (. - min(.)) / (max(.) - min(.))) %>%
+    mutate(
+      HubScore = 0.3*Degree + 0.3*Betweenness + 0.2*Eigenvector + 0.2*PageRank,
+      HubType = case_when(
+        Degree >= quantile(Degree, 0.75) & Betweenness >= quantile(Betweenness, 0.75) ~ "Super Hub",
+        Degree >= quantile(Degree, 0.75) ~ "Local Hub",
+        Betweenness >= quantile(Betweenness, 0.75) ~ "Bridge Hub",
+        TRUE ~ "Minor Hub"
+      )
+    )
+  
+  #-------------------------------
+  # Directed Edge List
+  #-------------------------------
+  edges_synchronization_directed <- tibble(
+    from = character(),
+    to = character(),
+    weight = numeric(),
+    lon_from = numeric(),
+    lat_from = numeric(),
+    lon_to = numeric(),
+    lat_to = numeric()
+  )
+  
+  for(i in 1:n){
+    for(j in 1:n){
+      w <- adj_mat[i,j]
+      if(w > 0){
+        edges_synchronization_directed <- add_row(edges_synchronization_directed,
+                                                  from = grids[i],
+                                                  to = grids[j],
+                                                  weight = w,
+                                                  lon_from = grid_coords$Lon[grid_coords$Grid==grids[i]],
+                                                  lat_from = grid_coords$Lat[grid_coords$Grid==grids[i]],
+                                                  lon_to = grid_coords$Lon[grid_coords$Grid==grids[j]],
+                                                  lat_to = grid_coords$Lat[grid_coords$Grid==grids[j]])
+      }
+    }
+  }
+  
+  #-------------------------------
+  # Save outputs
+  #-------------------------------
+  out_dir <- file.path("G:/Ph.D/Drought/CMIP6_work/Results", period_name)
+  if(!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+  
+  write_csv(metrics, file.path(out_dir, "drought_network_metrics.csv"))
+  write_csv(drought_onsets, file.path(out_dir, "drought_onset_events.csv"))
+  write_csv(asd_df, file.path(out_dir, "asd_values.csv"))
+  write_csv(edges_synchronization_directed, file.path(out_dir, "edges_synchronization_directed.csv"))
+  write.csv(sync_matrix, file.path(out_dir, "synchronization_matrix.csv"))
+  
+  message("Saved outputs to ", out_dir)
+}
+
+message("\nAll periods processed successfully!")

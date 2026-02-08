@@ -1,0 +1,168 @@
+# ----------------------------------------------------------
+# Script: 08_Probability_Ratio_PR.R
+# Purpose: Compute Probability Ratio (PR) of drought
+#          occurrence between historical and future periods
+# Input data:
+#   - NSPI-6 drought events
+# Output:
+#   - PR values for Moderate, Severe, Extreme drought
+#   - Spatial PR maps and plots
+# Related manuscript section: 2.7.2
+# Author: Rajkumar Guria & Manoranjan Mishra
+# ----------------------------------------------------------
+
+
+# Load necessary libraries
+library(ggplot2)
+library(dplyr)
+library(readr)
+library(hexbin)
+library(viridis)
+library(gridExtra)
+library(RColorBrewer)
+library(ggExtra)
+library(cowplot)
+library(grid)
+
+# Set file paths for exposure and PR data
+exposure_file_path <- "G:/Ph.D/Drought/Drought_population_exposer/New_population_exposer/Outputs_Exposer_Odisha/SSP5/future_exposure_person_months_by_grid.csv"
+pr_file_path       <- "G:/Ph.D/Drought/Drought_population_exposer/New_population_exposer/Outputs_Exposer_Odisha/SSP5/probability_ratio_by_grid.csv"
+
+# Load the datasets
+exposure_data <- read_csv(exposure_file_path)
+pr_data       <- read_csv(pr_file_path)
+
+# Merge the data by Grid_Number, Period, and Severity
+merged_data <- merge(exposure_data, pr_data, by = c("Grid_Number", "Period", "Severity"))
+
+# Calculate overall Pearson correlation
+correlation_value <- cor(merged_data$Exposure, merged_data$PR, method = "pearson")
+cat("Overall Correlation between Exposure and PR:", round(correlation_value, 3), "\n")
+
+# Create hexbin plot with marginal histograms
+make_marginal_plot <- function(data, period, severity, show_legend = FALSE) {
+  df <- data %>% filter(Period == period, Severity == severity)
+  
+  p <- ggplot(df, aes(x = PR, y = Exposure)) +  # Swapped x and y here
+    geom_hex(bins = 30, color = "white", alpha = 0.9) +
+    geom_point(alpha = 0.15, color = "black", size = 0.3) +
+    scale_fill_viridis_c(
+      name = "Counts", option = "magma", direction = -1, trans = "sqrt"
+    ) +
+    theme_minimal(base_size = 12) +
+    labs(
+      title = paste(period, "-", severity),
+      x = NULL, y = NULL
+    ) +
+    theme(
+      plot.title = element_text(size = 11, hjust = 0.5, face = "bold"),
+      panel.grid = element_blank(),
+      axis.ticks = element_line(color = "black", size = 0.3),
+      axis.text  = element_text(size = 9, color = "black"),
+      panel.border = element_rect(color = "black", fill = NA, size = 0.6), # border line
+      legend.position = if (show_legend) "right" else "none"
+    )
+  
+  ggMarginal(
+    p, type = "histogram", 
+    fill = "#87CEEB", color = "black",
+    alpha = 0.5, bins = 20, size = 4
+  )
+}
+
+# Unique levels (sorted to maintain order)
+periods    <- sort(unique(merged_data$Period))
+severities <- sort(unique(merged_data$Severity))
+
+# Modify the order of severities explicitly
+severities <- c("Moderate", "Severe", "Extreme")  # Explicit order
+
+# Make plots without legend
+plots_list <- list()
+for (per in periods) {
+  for (sev in severities) {
+    plots_list[[paste(per, sev)]] <- make_marginal_plot(merged_data, per, sev, show_legend = FALSE)
+  }
+}
+
+# Extract one plot with legend to use as shared
+legend_plot <- make_marginal_plot(merged_data, periods[1], severities[1], show_legend = TRUE)
+
+# Extract legend
+shared_legend <- cowplot::get_legend(legend_plot)
+
+# Arrange plots grid + legend
+final_plot <- gridExtra::grid.arrange(
+  do.call(arrangeGrob, c(plots_list, nrow = length(periods))),
+  shared_legend,
+  ncol = 2,
+  widths = c(4, 0.5),
+  top = grid::textGrob(
+    "Exposure vs Probability Ratio Across Periods and Drought Severities", 
+    gp = gpar(fontsize = 16, fontface = "bold")
+  )
+)
+
+# Summary statistics by Period and Severity
+summary_stats <- merged_data %>%
+  group_by(Period, Severity) %>%
+  summarise(
+    n = n(),
+    Mean_PR = mean(PR, na.rm = TRUE),
+    SD_PR = sd(PR, na.rm = TRUE),
+    Median_PR = median(PR, na.rm = TRUE),
+    Min_PR = min(PR, na.rm = TRUE),
+    Max_PR = max(PR, na.rm = TRUE),
+    Mean_Exposure = mean(Exposure, na.rm = TRUE),
+    SD_Exposure = sd(Exposure, na.rm = TRUE),
+    Median_Exposure = median(Exposure, na.rm = TRUE),
+    Min_Exposure = min(Exposure, na.rm = TRUE),
+    Max_Exposure = max(Exposure, na.rm = TRUE)
+  )
+
+# View the summary table
+print(summary_stats)
+
+# Correlation analysis table
+correlation_results <- merged_data %>%
+  group_by(Period, Severity) %>%
+  summarise(
+    Correlation = cor(PR, Exposure, method = "pearson", use = "complete.obs"),
+    P_value = cor.test(PR, Exposure)$p.value,
+    .groups = "drop"  # This removes the grouping after summarisation
+  )
+
+# View the correlation results table
+print(correlation_results)
+
+
+# Set file paths for saving the outputs
+pdf_output_path <- "G:/Ph.D/Drought/Drought_population_exposer/New_population_exposer/Outputs_Exposer_Odisha/Exposure_vs_Probability_Ratio_Plots_SSP2.pdf"
+summary_stats_output_path <- "G:/Ph.D/Drought/Drought_population_exposer/New_population_exposer/Outputs_Exposer_Odisha/summary_stats_SSP2.csv"
+correlation_results_output_path <- "G:/Ph.D/Drought/Drought_population_exposer/New_population_exposer/Outputs_Exposer_Odisha/correlation_results_SSP2.csv"
+
+# Save the figure (final plot) as a PDF
+ggsave(pdf_output_path, final_plot, device = "pdf", width = 15, height = 8)
+
+# Export summary statistics as CSV
+write_csv(summary_stats, summary_stats_output_path)
+
+# Export correlation results as CSV
+write_csv(correlation_results, correlation_results_output_path)
+
+# Print a message confirming the export
+cat("Figure saved to:", pdf_output_path, "\n")
+cat("Summary statistics saved to:", summary_stats_output_path, "\n")
+cat("Correlation results saved to:", correlation_results_output_path, "\n")
+
+
+
+
+
+
+
+
+
+
+
+

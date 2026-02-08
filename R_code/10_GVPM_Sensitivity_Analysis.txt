@@ -1,0 +1,612 @@
+# ----------------------------------------------------------
+# Script: 10_GVPM_Sensitivity_Analysis.R
+# Purpose: Sensitivity and uncertainty analysis of GVPM
+#          parameters (α, τ, T)
+# Input data:
+#   - GVPM outputs under multiple configurations
+# Output:
+#   - Spearman rank correlations
+#   - Spatial uncertainty (SD of vulnerability)
+# Related manuscript section: 2.8.6
+# Author: Rajkumar Guria & Manoranjan Mishra
+# ----------------------------------------------------------
+
+
+# ============================================================
+# Graph-Based Vulnerability Propagation Model (GVPM)
+# Sensitivity & Uncertainty Analysis — SSP5 (P1: 2025–2062)
+# ============================================================
+
+# ------------------------------------------------------------
+# 0) Load Required Libraries
+# ------------------------------------------------------------
+library(tidyverse)
+library(igraph)
+library(viridis)
+library(patchwork)
+
+# ------------------------------------------------------------
+# 1) Load Input Data
+# ------------------------------------------------------------
+centrality_data <- read_csv("G:/Ph.D/Drought/CMIP6_work/Results/SSP5/P1/drought_network_metrics.csv")
+exposure_data   <- read_csv("G:/Ph.D/Drought/Drought_population_exposer/New_population_exposer/Outputs_Exposer_Odisha/SSP5/future_exposure_person_months_by_grid.csv")
+network_data    <- read_csv("G:/Ph.D/Drought/CMIP6_work/Results/SSP5/P1/edges_synchronization_directed.csv")
+
+# ------------------------------------------------------------
+# 2) Filter Required Period (Future: 2025–2062)
+# ------------------------------------------------------------
+exposure_data <- exposure_data %>% filter(Period == "2025_2062")
+
+# ------------------------------------------------------------
+# 3) Harmonize Node Identifiers
+# ------------------------------------------------------------
+exposure_data <- exposure_data %>%
+  mutate(Grid_Number = as.character(Grid_Number))
+network_data <- network_data %>%
+  mutate(from = paste0("Grid_", from), to = paste0("Grid_", to))
+centrality_data <- centrality_data %>%
+  mutate(Grid = paste0("Grid_", Grid))
+
+# ------------------------------------------------------------
+# 4) Build Weighted Adjacency Matrix (W)
+# ------------------------------------------------------------
+nodes <- sort(unique(c(network_data$from, network_data$to)))
+W <- matrix(0, nrow = length(nodes), ncol = length(nodes),
+            dimnames = list(nodes, nodes))
+
+for(k in seq_len(nrow(network_data))) {
+  i <- network_data$to[k]
+  j <- network_data$from[k]
+  W[i, j] <- network_data$weight[k]
+}
+
+# Rescaling & normalization
+wmax <- max(W)
+if(is.finite(wmax) && wmax > 0) W <- W / wmax
+col_sums <- colSums(W); col_sums[col_sums == 0] <- 1
+W <- sweep(W, 2, col_sums, "/")
+
+# ------------------------------------------------------------
+# 5) Compute Initial Vulnerability (V0)
+# ------------------------------------------------------------
+severity_wt <- c(Moderate = 1.0, Severe = 2.0, Extreme = 3.0)
+
+initial_vuln <- exposure_data %>%
+  group_by(Grid_Number) %>%
+  summarise(TotalExposure = sum(Exposure),
+            RawScore = sum(Drought_Months * severity_wt[Severity]),
+            .groups = "drop") %>%
+  mutate(
+    Exp_mm = scales::rescale(TotalExposure, to = c(0, 1)),
+    Raw_mm = scales::rescale(RawScore, to = c(0, 1)),
+    InitialV = pmin(1, pmax(0, 0.5 * Exp_mm + 0.5 * Raw_mm + 1e-6))
+  ) %>%
+  select(Grid_Number, InitialV)
+
+init_vec <- initial_vuln %>%
+  inner_join(centrality_data %>% select(Grid), by = c("Grid_Number" = "Grid")) %>%
+  deframe()
+
+V0 <- rep(0, length(nodes)); names(V0) <- nodes
+V0[names(init_vec)] <- init_vec
+
+# ------------------------------------------------------------
+# 6) Influence Matrix with Betweenness Weighting
+# ------------------------------------------------------------
+BC_vec <- centrality_data %>% select(Grid, Betweenness) %>% deframe()
+BC_vec <- BC_vec[nodes]; BC_vec[is.na(BC_vec)] <- 0
+BC_vec <- BC_vec / max(BC_vec, na.rm = TRUE)
+M <- sweep(W, 2, BC_vec, "*")
+
+# ------------------------------------------------------------
+# 7) Propagation Dynamics Function
+# ------------------------------------------------------------
+propagate <- function(M, V0, alpha = 0.25, steps = 12, clamp = TRUE) {
+  out <- matrix(0, nrow = length(V0), ncol = steps + 1,
+                dimnames = list(names(V0), paste0("t", 0:steps)))
+  out[, 1] <- V0
+  Vt <- V0
+  for (t in seq_len(steps)) {
+    inflow <- as.numeric(M %*% Vt)
+    Vt_new <- (1 - alpha) * Vt + alpha * inflow
+    if (clamp) Vt_new <- pmin(pmax(Vt_new, 0), 1)
+    out[, t + 1] <- Vt_new
+    Vt <- Vt_new
+  }
+  out
+}
+
+alpha <- 0.25; steps <- 12
+V_ts <- propagate(M, V0, alpha, steps)
+
+# ------------------------------------------------------------
+# Output path
+# ------------------------------------------------------------
+out_path <- "G:/Ph.D/Drought/Drought_population_exposer/Graph-Based Vulnerability Propagation Model/New_vulnerability/Sensitivity/"
+if (!dir.exists(out_path)) dir.create(out_path, recursive = TRUE)
+
+# ------------------------------------------------------------
+# 7b) Sensitivity: Number of Iterations (T)
+# ------------------------------------------------------------
+T_values <- c(6, 12, 24)
+sens_results <- map(T_values, ~ propagate(M, V0, alpha, steps = .x)[, .x + 1])
+names(sens_results) <- paste0("T", T_values)
+sens_df <- bind_cols(sens_results) %>%
+  mutate(Grid = names(V0), .before = 1)
+
+cor_T12_T6  <- cor(sens_df$T12, sens_df$T6,  method = "spearman")
+cor_T12_T24 <- cor(sens_df$T12, sens_df$T24, method = "spearman")
+
+# ------------------------------------------------------------
+# 7c) Sensitivity: Propagation Rate (α)
+# ------------------------------------------------------------
+alpha_values <- c(0.1, 0.25, 0.4)
+alpha_results <- map(alpha_values, ~ propagate(M, V0, alpha = .x, steps = 12)[, 13])
+names(alpha_results) <- paste0("alpha_", alpha_values)
+alpha_df <- bind_cols(alpha_results) %>%
+  mutate(Grid = names(V0), .before = 1)
+
+corr_alpha_01 <- cor(alpha_df$alpha_0.25, alpha_df$alpha_0.1, method = "spearman")
+corr_alpha_04 <- cor(alpha_df$alpha_0.25, alpha_df$alpha_0.4, method = "spearman")
+
+# ------------------------------------------------------------
+# 7d) Sensitivity: τ (Event Synchronization Lag Thresholds)
+# ------------------------------------------------------------
+tau_values <- c(1, 2, 3, 4, 6)
+tau_results <- list()
+
+for (tau in tau_values) {
+  tau_network <- read_csv(paste0("G:/Ph.D/Drought/CMIP6_work/Results/SSP5/P1/edges_synchronization_directed_tau", tau, ".csv"))
+  nodes_tau <- sort(unique(c(tau_network$from, tau_network$to)))
+  W_tau <- matrix(0, nrow = length(nodes_tau), ncol = length(nodes_tau),
+                  dimnames = list(nodes_tau, nodes_tau))
+  for (k in seq_len(nrow(tau_network))) {
+    W_tau[tau_network$to[k], tau_network$from[k]] <- tau_network$weight[k]
+  }
+  W_tau <- W_tau / max(W_tau)
+  W_tau <- sweep(W_tau, 2, colSums(W_tau), "/")
+  M_tau <- sweep(W_tau, 2, BC_vec, "*")
+  V_tau <- propagate(M_tau, V0, alpha = 0.25, steps = 12)
+  tau_results[[paste0("tau_", tau)]] <- V_tau[, 13]
+}
+
+tau_df <- bind_cols(tau_results) %>%
+  mutate(Grid = names(V0), .before = 1)
+
+corr_tau <- sapply(tau_values, function(x)
+  cor(tau_df$tau_3, tau_df[[paste0("tau_", x)]], method = "spearman"))
+
+# Compute Mean & SD across τ
+tau_df <- tau_df %>%
+  rowwise() %>%
+  mutate(MeanV = mean(c_across(starts_with("tau_")), na.rm = TRUE),
+         SDV = sd(c_across(starts_with("tau_")), na.rm = TRUE)) %>%
+  ungroup() %>%
+  left_join(centrality_data %>% select(Grid, lon, lat), by = "Grid")
+
+# ------------------------------------------------------------
+# 8) Save Results
+# ------------------------------------------------------------
+write_csv(sens_df, paste0(out_path, "GVPM_T_sensitivity_results.csv"))
+write_csv(alpha_df, paste0(out_path, "GVPM_alpha_sensitivity_results.csv"))
+write_csv(tau_df, paste0(out_path, "GVPM_tau_sensitivity_results.csv"))
+
+# ------------------------------------------------------------
+# 9) Visualization — Correlation and Uncertainty
+# ------------------------------------------------------------
+
+# === Helper function for scatter correlation ===
+plot_corr <- function(df, xcol, ycol, label_x, label_y, rho, title_text) {
+  ggplot(df, aes_string(x = xcol, y = ycol)) +
+    geom_point(alpha = 0.4, color = "steelblue") +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+    coord_equal() +
+    labs(
+      x = label_x, y = label_y,
+      title = title_text,
+      subtitle = paste0("Spearman ρ = ", round(rho, 3))
+    ) +
+    theme_minimal(base_size = 12)
+}
+
+# ---- τ correlation plots ----
+tau_corr_plots <- map(c(1, 2, 4, 6), function(t) {
+  rho_val <- cor(tau_df$tau_3, tau_df[[paste0("tau_", t)]], method = "spearman")
+  plot_corr(tau_df, "tau_3", paste0("tau_", t),
+            "Nominal vulnerability (τ=3)",
+            paste0("Alternative (τ=", t, ")"),
+            rho_val, paste0("GVPM τ=3 vs τ=", t))
+})
+(tau_corr_plots[[1]] | tau_corr_plots[[2]]) /
+  (tau_corr_plots[[3]] | tau_corr_plots[[4]])
+
+# ---- α correlation plots ----
+alpha_corr_plots <- map(c(0.1, 0.4), function(a) {
+  rho_val <- cor(alpha_df$alpha_0.25, alpha_df[[paste0("alpha_", a)]], method = "spearman")
+  plot_corr(alpha_df, "alpha_0.25", paste0("alpha_", a),
+            "Nominal (α=0.25)", paste0("Alternative (α=", a, ")"),
+            rho_val, paste0("GVPM α=0.25 vs α=", a))
+})
+alpha_corr_plots[[1]] | alpha_corr_plots[[2]]
+
+# ---- T correlation plots ----
+T_corr_plots <- map(c(6, 24), function(T_val) {
+  rho_val <- cor(sens_df$T12, sens_df[[paste0("T", T_val)]], method = "spearman")
+  plot_corr(sens_df, "T12", paste0("T", T_val),
+            "Nominal (T=12)", paste0("Alternative (T=", T_val, ")"),
+            rho_val, paste0("GVPM T=12 vs T=", T_val))
+})
+T_corr_plots[[1]] | T_corr_plots[[2]]
+
+# ---- Uncertainty map (SDV) ----
+ggplot(tau_df, aes(x = lon, y = lat, fill = SDV)) +
+  geom_raster() +
+  scale_fill_viridis(name = "SD(V)", option = "C") +
+  labs(title = "Spatial uncertainty in GVPM vulnerability (across τ)") +
+  theme_minimal()
+
+
+# ------------------------------------------------------------
+# 10) Create Summary Sensitivity Table
+# ------------------------------------------------------------
+
+sensitivity_summary <- tibble(
+  Parameter = c("Propagation steps (T)", "Propagation steps (T)",
+                "Propagation rate (α)", "Propagation rate (α)",
+                "Lag threshold (τ)", "Lag threshold (τ)",
+                "Lag threshold (τ)", "Lag threshold (τ)"),
+  Comparison = c("T=12 vs T=6", "T=12 vs T=24",
+                 "α=0.25 vs α=0.1", "α=0.25 vs α=0.4",
+                 "τ=3 vs τ=1", "τ=3 vs τ=2", "τ=3 vs τ=4", "τ=3 vs τ=6"),
+  Spearman_rho = c(
+    round(cor_T12_T6, 3),
+    round(cor_T12_T24, 3),
+    round(corr_alpha_01, 3),
+    round(corr_alpha_04, 3),
+    round(corr_tau[1], 3),
+    round(corr_tau[2], 3),
+    round(corr_tau[4], 3),
+    round(corr_tau[5], 3)
+  )
+)
+
+print(sensitivity_summary)
+
+write_csv(sensitivity_summary, paste0(out_path, "GVPM_Sensitivity_Summary.csv"))
+
+
+# ============================================================
+# End of Script
+# ============================================================
+
+# ------------------------------------------------------------
+# Improved α (propagation rate) correlation panel — same scale and ratio
+# ------------------------------------------------------------
+
+# Determine global scale for both α plots
+alpha_limits <- range(
+  c(alpha_df$alpha_0.25, alpha_df$alpha_0.1, alpha_df$alpha_0.4),
+  na.rm = TRUE
+)
+
+alpha_corr_plots <- map(c(0.1, 0.4), function(a) {
+  rho_val <- cor(alpha_df$alpha_0.25, alpha_df[[paste0("alpha_", a)]], method = "spearman")
+  ggplot(alpha_df, aes(x = alpha_0.25, y = .data[[paste0("alpha_", a)]])) +
+    geom_point(aes(color = alpha_0.25), size = 2, alpha = 0.5) +
+    geom_smooth(method = "lm", se = FALSE, color = "black", linetype = "dashed") +
+    geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dotted") +
+    coord_equal(xlim = alpha_limits, ylim = alpha_limits) +
+    scale_color_viridis(option = "C", direction = -1) +
+    labs(
+      title = paste0("GVPM α=0.25 vs α=", a),
+      subtitle = paste0("Spearman ρ = ", round(rho_val, 3)),
+      x = "Nominal (α=0.25)",
+      y = paste0("Alternative (α=", a, ")"),
+      color = "Vulnerability"
+    ) +
+    theme_minimal(base_size = 13) +
+    theme(
+      plot.title = element_text(face = "bold", size = 11),
+      plot.subtitle = element_text(size = 10, color = "gray30"),
+      panel.grid.minor = element_blank()
+    )
+})
+
+alpha_corr_panel <- (alpha_corr_plots[[1]] | alpha_corr_plots[[2]]) +
+  plot_annotation(
+    title = "GVPM Sensitivity to Propagation Rate (α)",
+    theme = theme(plot.title = element_text(face = "bold", size = 14))
+  )
+
+
+
+print(alpha_corr_panel)
+
+
+# ------------------------------------------------------------
+# Improved T (Propagation Steps) correlation panel
+# ------------------------------------------------------------
+
+# Determine global axis range across all T comparisons
+T_limits <- range(
+  c(sens_df$T12, sens_df$T6, sens_df$T24),
+  na.rm = TRUE
+)
+
+T_corr_plots <- map(c(6, 24), function(T_val) {
+  rho_val <- cor(sens_df$T12, sens_df[[paste0("T", T_val)]], method = "spearman")
+  ggplot(sens_df, aes(x = T12, y = .data[[paste0("T", T_val)]])) +
+    geom_point(aes(color = T12), size = 2, alpha = 0.6) +
+    geom_smooth(method = "lm", se = FALSE, color = "black", linetype = "dashed") +
+    geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dotted") +
+    coord_equal(xlim = T_limits, ylim = T_limits) +
+    scale_color_viridis(option = "C", direction = -1) +
+    labs(
+      title = paste0("GVPM T=12 vs T=", T_val),
+      subtitle = paste0("Spearman ρ = ", round(rho_val, 3)),
+      x = "Nominal (T=12)",
+      y = paste0("Alternative (T=", T_val, ")"),
+      color = "Vulnerability"
+    ) +
+    theme_minimal(base_size = 13) +
+    theme(
+      plot.title = element_text(face = "bold", size = 11),
+      plot.subtitle = element_text(size = 10, color = "gray30"),
+      panel.grid.minor = element_blank()
+    )
+})
+
+T_corr_panel <- (T_corr_plots[[1]] | T_corr_plots[[2]]) +
+  plot_annotation(
+    title = "GVPM Sensitivity to Propagation Steps (T)",
+    theme = theme(plot.title = element_text(face = "bold", size = 14))
+  )
+
+print(T_corr_panel)
+
+
+
+
+# ------------------------------------------------------------
+# Improved τ (Lag Threshold) Correlation Panel
+# ------------------------------------------------------------
+
+# Determine global axis range for τ comparisons
+tau_limits <- range(
+  c(tau_df$tau_1, tau_df$tau_2, tau_df$tau_3, tau_df$tau_4, tau_df$tau_6),
+  na.rm = TRUE
+)
+
+# Function to make correlation plot
+tau_corr_plots <- map(c(1, 2, 4, 6), function(t) {
+  rho_val <- cor(tau_df$tau_3, tau_df[[paste0("tau_", t)]], method = "spearman")
+  
+  ggplot(tau_df, aes(x = tau_3, y = .data[[paste0("tau_", t)]])) +
+    geom_point(aes(color = tau_3), size = 2, alpha = 0.6) +
+    geom_smooth(method = "lm", se = FALSE, color = "black", linetype = "dashed") +
+    geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dotted") +
+    coord_equal(xlim = tau_limits, ylim = tau_limits) +
+    scale_color_viridis(option = "C", direction = -1) +
+    labs(
+      title = paste0("GVPM τ=3 vs τ=", t),
+      subtitle = paste0("Spearman ρ = ", round(rho_val, 3)),
+      x = "Nominal vulnerability (τ=3)",
+      y = paste0("Alternative (τ=", t, ")"),
+      color = "Vulnerability"
+    ) +
+    theme_minimal(base_size = 13) +
+    theme(
+      plot.title = element_text(face = "bold", size = 11),
+      plot.subtitle = element_text(size = 10, color = "gray30"),
+      panel.grid.minor = element_blank()
+    )
+})
+
+# Combine as a 2x2 grid
+tau_corr_panel <- 
+  (tau_corr_plots[[1]] | tau_corr_plots[[2]]) /
+  (tau_corr_plots[[3]] | tau_corr_plots[[4]]) +
+  plot_annotation(
+    title = "GVPM Sensitivity to Lag Threshold (τ)",
+    subtitle = "Consistency of vulnerability propagation across event synchronization lags",
+    theme = theme(plot.title = element_text(face = "bold", size = 14))
+  )
+
+# Print the full τ panel
+tau_corr_panel
+
+
+
+
+# Define output directory
+out_path <- "G:/Ph.D/Drought/Drought_population_exposer/Graph-Based Vulnerability Propagation Model/New_vulnerability/Sensitivity/Plots/"
+if (!dir.exists(out_path)) dir.create(out_path, recursive = TRUE)
+
+# --- Save T correlation panel ---
+ggsave(
+  filename = paste0(out_path, "GVPM_Sensitivity_T.pdf"),
+  plot = T_corr_panel,
+  width = 8, height = 4, units = "in", device = cairo_pdf, dpi = 300
+)
+
+# --- Save α correlation panel ---
+ggsave(
+  filename = paste0(out_path, "GVPM_Sensitivity_alpha.pdf"),
+  plot = alpha_corr_panel,
+  width = 8, height = 4, units = "in", device = cairo_pdf, dpi = 300
+)
+
+# --- Save τ correlation panel ---
+ggsave(
+  filename = paste0(out_path, "GVPM_Sensitivity_tau.pdf"),
+  plot = tau_corr_panel,
+  width = 8, height = 6, units = "in", device = cairo_pdf, dpi = 300
+)
+
+
+
+
+
+# ------------------------------------------------------------
+# Load Required Libraries
+# ------------------------------------------------------------
+library(ggplot2)
+library(viridis)
+library(ggspatial)
+library(sf)
+
+# ------------------------------------------------------------
+# Load Odisha shapefile
+# ------------------------------------------------------------
+odisha_shp <- st_read("G:/Forest_Fire/Odisha_GSI_Boundary/Odisha_Dist_UTM45.shp")
+
+library(sf)
+library(ggspatial)
+library(viridis)
+library(ggplot2)
+
+# Reproject both layers to WGS84 for clean plotting
+odisha_shp_wgs <- st_transform(odisha_shp, crs = 4326)
+
+# Convert tau_df to sf points in WGS84 (lon/lat)
+tau_sf <- st_as_sf(tau_df, coords = c("lon", "lat"), crs = 4326)
+
+# Define Odisha bounding box for proper zoom
+odisha_bbox <- st_bbox(odisha_shp_wgs)
+
+# Improved Uncertainty Map (Publication Quality)
+uncertainty_map_plot <- ggplot() +
+  geom_sf(data = odisha_shp_wgs, fill = "grey97", color = "black", size = 0.4) +
+  geom_sf(data = tau_sf, aes(color = SDV), size = 2, alpha = 0.8) +
+  scale_color_viridis(
+    name = "Uncertainty (SD(V))",
+    option = "C",
+    direction = -1,
+    limits = c(min(tau_df$SDV, na.rm = TRUE), max(tau_df$SDV, na.rm = TRUE)),
+    guide = guide_colorbar(
+      title.position = "top",
+      barwidth = unit(5, "cm"),
+      barheight = unit(0.4, "cm")
+    )
+  ) +
+  coord_sf(
+    xlim = c(odisha_bbox["xmin"], odisha_bbox["xmax"]),
+    ylim = c(odisha_bbox["ymin"], odisha_bbox["ymax"]),
+    expand = FALSE
+  ) +
+  annotation_scale(location = "bl", width_hint = 0.3, text_cex = 0.8) +
+  annotation_north_arrow(
+    location = "tl",
+    which_north = "true",
+    style = north_arrow_fancy_orienteering(text_size = 8)
+  ) +
+  labs(
+    title = "Spatial Uncertainty in GVPM Vulnerability (across τ)",
+    subtitle = "Standard deviation of propagated vulnerability (τ = 1–6 months)",
+    x = "Longitude",
+    y = "Latitude"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 11, color = "gray30"),
+    legend.position = "bottom",
+    legend.title = element_text(hjust = 0.5, size = 11),
+    legend.text = element_text(size = 10),
+    panel.grid = element_blank(),
+    axis.text = element_text(size = 10)
+  )
+
+# Export
+ggsave(
+  filename = paste0(out_path, "GVPM_Uncertainty_Map_Odisha.pdf"),
+  plot = uncertainty_map_plot,
+  width = 6, height = 5, units = "in",
+  dpi = 600, device = cairo_pdf
+)
+
+
+print (uncertainty_map_plot)
+
+
+
+# Export high-resolution PDF
+ggsave(
+  filename = paste0(out_path, "GVPM_Uncertainty_Map_with_Boundary.pdf"),
+  plot = uncertainty_map_plot,
+  width = 6.5, height = 5.5, units = "in",
+  device = cairo_pdf, dpi = 600
+)
+
+
+
+
+
+
+
+
+
+
+
+
+# Improved Uncertainty Map (Publication Quality)
+uncertainty_map_plot <- ggplot() +
+  geom_sf(data = odisha_shp_wgs, fill = "grey97", color = "black", size = 0.4) +
+  geom_sf(data = tau_sf, aes(color = SDV), size = 2, alpha = 0.8) +
+  scale_color_viridis(
+    name = "Uncertainty (SD(V))",
+    option = "C",
+    direction = -1,
+    limits = range(tau_df$SDV, na.rm = TRUE),
+    guide = guide_colorbar(
+      title.position = "top",
+      barwidth = unit(5, "cm"),
+      barheight = unit(0.4, "cm")
+    )
+  ) +
+  coord_sf(
+    xlim = c(odisha_bbox["xmin"], odisha_bbox["xmax"]),
+    ylim = c(odisha_bbox["ymin"], odisha_bbox["ymax"]),
+    expand = FALSE
+  ) +
+  # Move scale bar to bottom-right
+  annotation_scale(
+    location = "br",
+    width_hint = 0.3,
+    pad_x = unit(0.5, "cm"),
+    pad_y = unit(0.5, "cm"),
+    text_cex = 0.8
+  ) +
+  # Keep north arrow at top-left
+  annotation_north_arrow(
+    location = "tl",
+    which_north = "true",
+    style = north_arrow_fancy_orienteering(text_size = 8),
+    pad_x = unit(0.6, "cm"),
+    pad_y = unit(0.6, "cm")
+  ) +
+  labs(
+    title = "Spatial Uncertainty in GVPM Vulnerability (across τ)",
+    subtitle = "Standard deviation of propagated vulnerability (τ = 1–6 months)",
+    x = "Longitude", y = "Latitude"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 11, color = "gray30"),
+    legend.position = "bottom",
+    legend.title = element_text(hjust = 0.5, size = 11),
+    legend.text = element_text(size = 10),
+    panel.grid = element_blank(),
+    axis.text = element_text(size = 10)
+  )
+
+# Export
+ggsave(
+  filename = paste0(out_path, "GVPM_Uncertainty_Map_Odisha_RightScale.pdf"),
+  plot = uncertainty_map_plot,
+  width = 6, height = 5, units = "in",
+  dpi = 600, device = cairo_pdf
+)
+
+print(uncertainty_map_plot)

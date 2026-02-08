@@ -1,0 +1,50 @@
+# ----------------------------------------------------------
+# Script: 03_Bias_Correction_Comparison.R
+# Purpose: Compare CMIP6 rainfall before and after bias
+#          correction to assess improvement
+# Input data:
+#   - Raw CMIP6 rainfall
+#   - Bias-corrected CMIP6 rainfall
+#   - IMD observed rainfall
+# Output:
+#   - Comparative statistics and plots
+# Related manuscript section: 3.1 (Supplementary)
+# Author: Rajkumar Guria & Manoranjan Mishra
+# ----------------------------------------------------------
+
+
+library(tidyverse)
+before <- read_csv("G:/Ph.D/Drought/CMIP6_work/Data/CMIP6_data/CMIP6_model_grid_metrics.csv")                # Before correction
+after  <- read_csv("G:/Ph.D/Drought/CMIP6_work/Data/CMIP6_data/CMIP6_model_grid_metrics_biascorrected.csv")  # After correction
+
+#Recommended Data Merge
+before <- before %>% mutate(evaluation = "Before Bias Correction")
+after  <- after %>% mutate(evaluation = "After Bias Correction")
+combined <- bind_rows(before, after)
+
+#2. Creating a Comparison Table
+comparison_tbl <- combined %>%
+  group_by(model, evaluation) %>%
+  summarize(
+    Correlation = mean(r, na.rm=TRUE),
+    Bias = mean(bias, na.rm=TRUE),
+    RMSE = mean(rmse, na.rm=TRUE),
+    NSE = mean(nse, na.rm=TRUE),
+    KGE = mean(kge, na.rm=TRUE),
+    Composite = mean(composite, na.rm=TRUE)
+  ) %>%
+  pivot_wider(names_from = evaluation,
+              values_from = c(Correlation, Bias, RMSE, NSE, KGE, Composite))
+#3. Creating a Comparison Plot
+library(ggplot2)
+plot_tbl <- combined %>%
+  group_by(model, evaluation) %>%
+  summarize(median_composite = median(composite, na.rm=TRUE))
+
+ggplot(plot_tbl, aes(x = model, y = median_composite, fill = evaluation)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.7), width=0.6) +
+  labs(title = "Model Composite Score: Before vs After Bias Correction",
+       x = "Model", y = "Median Composite Score") +
+  scale_fill_brewer(palette = "Set1") +
+  theme_minimal(base_size = 13)
+
